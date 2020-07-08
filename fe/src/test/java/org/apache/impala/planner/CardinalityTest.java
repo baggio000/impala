@@ -93,8 +93,7 @@ public class CardinalityTest extends PlannerTestBase {
     verifyCardinality(
         "select id from functional.alltypesaggnonulls where int_col IS NULL", 1);
     verifyCardinality(
-        "select id from functional.alltypesaggnonulls where int_col IS NOT NULL",
-        10000);
+        "select id from functional.alltypesaggnonulls where int_col IS NOT NULL", 10000);
 
     // Grouping should reduce cardinality
     verifyCardinality(

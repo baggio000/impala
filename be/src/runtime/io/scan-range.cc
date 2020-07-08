@@ -16,10 +16,11 @@
 // under the License.
 
 #include "runtime/exec-env.h"
-#include "runtime/io/disk-io-mgr.h"
 #include "runtime/io/disk-io-mgr-internal.h"
+#include "runtime/io/disk-io-mgr.h"
 #include "runtime/io/hdfs-file-reader.h"
 #include "runtime/io/local-file-reader.h"
+#include "runtime/tmp-file-mgr-internal.h"
 #include "util/error-util.h"
 #include "util/hdfs-util.h"
 
@@ -203,8 +204,43 @@ ReadOutcome ScanRange::DoRead(DiskQueue* queue, int disk_id) {
        (FLAGS_cache_s3_file_handles && disk_id_ == io_mgr_->RemoteS3DiskId()))) {
     use_file_handle_cache = true;
   }
+
+  // TODO: yidawu check why tmp_file_ is null in some case
+  /*  if (tmp_file_ != nullptr && (disk_id_ == io_mgr_->RemoteDfsDiskId() ||
+      disk_id_ == io_mgr_->RemoteS3DiskId()) ) {*/
+  if (tmp_file_ != nullptr) {
+    TmpFileRemote* tmp_file = (TmpFileRemote*)tmp_file_;
+    {
+      lock_guard<SpinLock> lock(*(tmp_file->BufferLock()));
+      // If it is in memory, read it from memory
+      if (tmp_file->is_in_memory()) {
+        // TODO: yidawu Reach data from buffer
+        // TODO: need to add metric
+        memcpy(buffer_desc->buffer_, tmp_file->WriteBuffer() + offset_, bytes_to_read_);
+        // TODO: not sure if it is eof if have read all
+        buffer_desc->eosr_ = true;
+        buffer_desc->len_ = bytes_to_read_;
+        if (!EnqueueReadyBuffer(move(buffer_desc))) return ReadOutcome::CANCELLED;
+        return ReadOutcome::SUCCESS_EOSR;
+      }
+    }
+    // If it is in remote, and the local buffer has been deleted
+    // fetch the file from remote
+    if (!tmp_file->is_dumped()) {
+      DCHECK(tmp_file->is_remote());
+
+      // evict an old file if the buffer in local disk is full
+
+      // get the file
+      // The connection belongs to the queue, only queue will call the function,
+      // so it is supposed the connection is only used by the current thread
+      tmp_file->FetchFromRemote();
+    }
+  }
+
   Status read_status = file_reader_->Open(use_file_handle_cache);
   bool eof = false;
+
   if (read_status.ok()) {
     COUNTER_ADD_IF_NOT_NULL(reader_->active_read_thread_counter_, 1L);
     COUNTER_BITOR_IF_NOT_NULL(reader_->disks_accessed_bitmap_, 1LL << disk_id);
@@ -444,9 +480,9 @@ ScanRange::~ScanRange() {
 
 void ScanRange::Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset,
     int disk_id, bool expected_local, bool is_erasure_coded, int64_t mtime,
-    const BufferOpts& buffer_opts, void* meta_data) {
+    const BufferOpts& buffer_opts, void* meta_data, TmpFile* tmpfile) {
   Reset(fs, file, len, offset, disk_id, expected_local, is_erasure_coded, mtime,
-      buffer_opts, {}, meta_data);
+      buffer_opts, {}, meta_data, tmpfile);
 }
 
 ScanRange* ScanRange::AllocateScanRange(ObjectPool* obj_pool, hdfsFS fs, const char* file,
@@ -466,7 +502,8 @@ ScanRange* ScanRange::AllocateScanRange(ObjectPool* obj_pool, hdfsFS fs, const c
 
 void ScanRange::Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset,
     int disk_id, bool expected_local, bool is_erasure_coded, int64_t mtime,
-    const BufferOpts& buffer_opts, vector<SubRange>&& sub_ranges, void* meta_data) {
+    const BufferOpts& buffer_opts, vector<SubRange>&& sub_ranges, void* meta_data,
+    TmpFile* tmp_file) {
   DCHECK(ready_buffers_.empty());
   DCHECK(!read_in_flight_);
   DCHECK(file != nullptr);
@@ -486,6 +523,7 @@ void ScanRange::Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset,
   offset_ = offset;
   disk_id_ = disk_id;
   cache_options_ = buffer_opts.cache_options_;
+  tmp_file_ = tmp_file;
 
   // HDFS ranges must have an mtime > 0. Local ranges do not use mtime.
   if (fs_) DCHECK_GT(mtime, 0);

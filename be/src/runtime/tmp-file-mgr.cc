@@ -33,7 +33,10 @@
 #include "kudu/util/env.h"
 #include "runtime/bufferpool/buffer-pool-counters.h"
 #include "runtime/exec-env.h"
+#include "runtime/hdfs-fs-cache.h"
 #include "runtime/io/disk-io-mgr.h"
+#include "runtime/io/hdfs-file-writer.h"
+#include "runtime/io/local-file-writer.h"
 #include "runtime/io/request-context.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/runtime-state.h"
@@ -44,12 +47,14 @@
 #include "util/debug-util.h"
 #include "util/disk-info.h"
 #include "util/filesystem-util.h"
+#include "util/hdfs-util.h"
+#include "util/histogram-metric.h"
 #include "util/kudu-status-util.h"
+#include "util/os-util.h"
 #include "util/parse-util.h"
 #include "util/pretty-printer.h"
 #include "util/runtime-profile-counters.h"
 #include "util/scope-exit-trigger.h"
-#include "util/string-parser.h"
 
 #include "common/names.h"
 
@@ -75,18 +80,11 @@ DEFINE_bool(disk_spill_punch_holes, false,
 DEFINE_string(scratch_dirs, "/tmp",
     "Writable scratch directories. "
     "This is a comma-separated list of directories. Each directory is "
-    "specified as the directory path, an optional limit on the bytes that will "
-    "be allocated in that directory, and an optional priority for the directory. "
-    "If the optional limit is provided, the path and "
+    "specified as the directory path and an optional limit on the bytes that will "
+    "be allocated in that directory. If the optional limit is provided, the path and "
     "the limit are separated by a colon. E.g. '/dir1:10G,/dir2:5GB,/dir3' will allow "
     "allocating up to 10GB of scratch in /dir1, 5GB of scratch in /dir2 and an "
-    "unlimited amount in /dir3. "
-    "If the optional priority is provided, the path and the limit and priority are "
-    "separated by colon. Priority based spilling will result in directories getting "
-    "selected as a spill target based on their priority. The lower the numerical value "
-    "the higher the priority. E.g. '/dir1:10G:0,/dir2:5GB:1,/dir3::1', will cause "
-    "spilling to first fill up '/dir1' followed by using '/dir2' and '/dir3' in a "
-    "round robin manner.");
+    "unlimited amount in /dir3.");
 DEFINE_bool(allow_multiple_scratch_dirs_per_device, true,
     "If false and --scratch_dirs contains multiple directories on the same device, "
     "then only the first writable directory is used");
@@ -94,7 +92,6 @@ DEFINE_bool(allow_multiple_scratch_dirs_per_device, true,
 using boost::algorithm::is_any_of;
 using boost::algorithm::join;
 using boost::algorithm::split;
-using boost::algorithm::token_compress_off;
 using boost::algorithm::token_compress_on;
 using boost::filesystem::absolute;
 using boost::filesystem::path;
@@ -126,6 +123,8 @@ const string SCRATCH_DIR_BYTES_USED_FORMAT =
 using DeviceId = TmpFileMgr::DeviceId;
 using TmpDir = TmpFileMgr::TmpDir;
 using WriteDoneCallback = TmpFileMgr::WriteDoneCallback;
+
+hdfsFS hdfs_connection_ = nullptr;
 
 TmpFileMgr::TmpFileMgr() {}
 
@@ -174,98 +173,108 @@ Status TmpFileMgr::InitCustom(const vector<string>& tmp_dir_specifiers,
               ExecEnv::GetInstance()->process_mem_tracker()));
     }
   }
-  vector<std::unique_ptr<TmpDir>> tmp_dirs;
+  vector<TmpDir> tmp_dirs;
+
   // Parse the directory specifiers. Don't return an error on parse errors, just log a
   // warning - we don't want to abort process startup because of misconfigured scratch,
   // since queries will generally still be runnable.
   for (const string& tmp_dir_spec : tmp_dir_specifiers) {
+    string tmp_dirs_without_prefix, prefix;
+    string tmp_dir_spec_trimed(boost::algorithm::trim_left_copy(tmp_dir_spec));
+
+    if (IsHdfsPath(tmp_dir_spec_trimed.c_str(), false)) {
+      prefix = FILESYS_PREFIX_HDFS;
+      tmp_dirs_without_prefix = tmp_dir_spec_trimed.substr(strlen(FILESYS_PREFIX_HDFS));
+    } else if (IsS3APath(tmp_dir_spec.c_str(), false)) {
+      prefix = FILESYS_PREFIX_S3;
+      tmp_dirs_without_prefix = tmp_dir_spec_trimed.substr(strlen(FILESYS_PREFIX_S3));
+    } else {
+      prefix = "";
+      tmp_dirs_without_prefix = tmp_dir_spec_trimed.substr(0);
+    }
+
     vector<string> toks;
-    split(toks, tmp_dir_spec, is_any_of(":"), token_compress_off);
-    if (toks.size() > 3) {
+    split(toks, tmp_dirs_without_prefix, is_any_of(":"), token_compress_on);
+    if (toks.size() > 2) {
       LOG(ERROR) << "Could not parse temporary dir specifier, too many colons: '"
                  << tmp_dir_spec << "'";
       continue;
     }
     int64_t bytes_limit = numeric_limits<int64_t>::max();
-    if (toks.size() >= 2) {
+    if (toks.size() == 2) {
       bool is_percent;
       bytes_limit = ParseUtil::ParseMemSpec(toks[1], &is_percent, 0);
       if (bytes_limit < 0 || is_percent) {
-        LOG(ERROR) << "Malformed scratch directory capacity configuration '"
-                   << tmp_dir_spec << "'";
+        LOG(ERROR) << "Malformed data cache capacity configuration '" << tmp_dir_spec
+                   << "'";
         continue;
       } else if (bytes_limit == 0) {
         // Interpret -1, 0 or empty string as no limit.
         bytes_limit = numeric_limits<int64_t>::max();
       }
     }
-    int priority = numeric_limits<int>::max();
-    if (toks.size() == 3 && !toks[2].empty()) {
-      StringParser::ParseResult result;
-      priority = StringParser::StringToInt<int>(toks[2].data(), toks[2].size(), &result);
-      if (result != StringParser::PARSE_SUCCESS) {
-        LOG(ERROR) << "Malformed scratch directory priority configuration '"
-                   << tmp_dir_spec << "'";
-        continue;
-      }
-    }
     IntGauge* bytes_used_metric = metrics->AddGauge(
         SCRATCH_DIR_BYTES_USED_FORMAT, 0, Substitute("$0", tmp_dirs.size()));
-    tmp_dirs.emplace_back(new TmpDir(toks[0], bytes_limit, priority, bytes_used_metric));
+    tmp_dirs.emplace_back(prefix.append(toks[0]), bytes_limit, bytes_used_metric);
   }
-
-  // Sort the tmp directories by priority.
-  std::sort(tmp_dirs.begin(), tmp_dirs.end(),
-      [](const std::unique_ptr<TmpDir>& a, const std::unique_ptr<TmpDir>& b) {
-        return a->priority < b->priority;
-      });
 
   vector<bool> is_tmp_dir_on_disk(DiskInfo::num_disks(), false);
   // For each tmp directory, find the disk it is on,
   // so additional tmp directories on the same disk can be skipped.
   for (int i = 0; i < tmp_dirs.size(); ++i) {
-    path tmp_path(trim_right_copy_if(tmp_dirs[i]->path, is_any_of("/")));
-    tmp_path = absolute(tmp_path);
-    path scratch_subdir_path(tmp_path / TMP_SUB_DIR_NAME);
-    // tmp_path must be a writable directory.
-    Status status = FileSystemUtil::VerifyIsDirectory(tmp_path.string());
-    if (!status.ok()) {
-      LOG(WARNING) << "Cannot use directory " << tmp_path.string() << " for scratch: "
-                   << status.msg().msg();
-      continue;
-    }
-    // Find the disk id of tmp_path. Add the scratch directory if there isn't another
-    // directory on the same disk (or if we don't know which disk it is on).
-    int disk_id = DiskInfo::disk_id(tmp_path.c_str());
-    if (!one_dir_per_device || disk_id < 0 || !is_tmp_dir_on_disk[disk_id]) {
-      uint64_t available_space;
-      RETURN_IF_ERROR(FileSystemUtil::GetSpaceAvailable(tmp_path.string(),
-          &available_space));
-      if (available_space < AVAILABLE_SPACE_THRESHOLD_MB * 1024 * 1024) {
-        LOG(WARNING) << "Filesystem containing scratch directory " << tmp_path
-                     << " has less than " << AVAILABLE_SPACE_THRESHOLD_MB
-                     << "MB available.";
+    Status status;
+    path tmp_path(trim_right_copy_if(tmp_dirs[i].path, is_any_of("/")));
+    if (IsHdfsPath(tmp_path.c_str(), false)) {
+      tmp_dirs_.emplace_back(tmp_path.string(), tmp_dirs[i].bytes_limit,
+          tmp_dirs[i].bytes_used_metric, false);
+    } else if (IsS3APath(tmp_path.c_str(), false)) {
+      tmp_dirs_.emplace_back(tmp_path.string(), tmp_dirs[i].bytes_limit,
+          tmp_dirs[i].bytes_used_metric, false);
+    } else {
+      tmp_path = absolute(tmp_path);
+      path scratch_subdir_path(tmp_path / TMP_SUB_DIR_NAME);
+      // tmp_path must be a writable directory.
+      status = FileSystemUtil::VerifyIsDirectory(tmp_path.string());
+      if (!status.ok()) {
+        LOG(WARNING) << "Cannot use directory " << tmp_path.string()
+                     << " for scratch: " << status.msg().msg();
+        continue;
       }
-      // Create the directory, destroying if already present. If this succeeds, we will
-      // have an empty writable scratch directory.
-      status = FileSystemUtil::RemoveAndCreateDirectory(scratch_subdir_path.string());
-      if (status.ok()) {
-        if (disk_id >= 0) is_tmp_dir_on_disk[disk_id] = true;
-        LOG(INFO) << "Using scratch directory " << scratch_subdir_path.string() << " on "
-                  << "disk " << disk_id
-                  << " limit: " << PrettyPrinter::PrintBytes(tmp_dirs[i]->bytes_limit);
-        tmp_dirs_.emplace_back(scratch_subdir_path.string(), tmp_dirs[i]->bytes_limit,
-            tmp_dirs[i]->priority, tmp_dirs[i]->bytes_used_metric);
-      } else {
-        LOG(WARNING) << "Could not remove and recreate directory "
-                     << scratch_subdir_path.string() << ": cannot use it for scratch. "
-                     << "Error was: " << status.msg().msg();
-      }
-      if (punch_holes_) {
-        // Make sure hole punching is supported for the directory.
-        // IMPALA-9798: this file should *not* be created inside impala-scratch
-        // subdirectory to avoid races with multiple impalads starting up.
-        RETURN_IF_ERROR(FileSystemUtil::CheckHolePunch(tmp_path.string()));
+
+      // Find the disk id of tmp_path. Add the scratch directory if there isn't another
+      // directory on the same disk (or if we don't know which disk it is on).
+      int disk_id = DiskInfo::disk_id(tmp_path.c_str());
+      if (!one_dir_per_device || disk_id < 0 || !is_tmp_dir_on_disk[disk_id]) {
+        uint64_t available_space;
+        RETURN_IF_ERROR(
+            FileSystemUtil::GetSpaceAvailable(tmp_path.string(), &available_space));
+        if (available_space < AVAILABLE_SPACE_THRESHOLD_MB * 1024 * 1024) {
+          LOG(WARNING) << "Filesystem containing scratch directory " << tmp_path
+                       << " has less than " << AVAILABLE_SPACE_THRESHOLD_MB
+                       << "MB available.";
+        }
+        // Create the directory, destroying if already present. If this succeeds, we will
+        // have an empty writable scratch directory.
+        status = FileSystemUtil::RemoveAndCreateDirectory(scratch_subdir_path.string());
+        if (status.ok()) {
+          if (disk_id >= 0) is_tmp_dir_on_disk[disk_id] = true;
+          LOG(INFO) << "Using scratch directory " << scratch_subdir_path.string()
+                    << " on "
+                    << "disk " << disk_id
+                    << " limit: " << PrettyPrinter::PrintBytes(tmp_dirs[i].bytes_limit);
+          tmp_dirs_.emplace_back(scratch_subdir_path.string(), tmp_dirs[i].bytes_limit,
+              tmp_dirs[i].bytes_used_metric);
+        } else {
+          LOG(WARNING) << "Could not remove and recreate directory "
+                       << scratch_subdir_path.string() << ": cannot use it for scratch. "
+                       << "Error was: " << status.msg().msg();
+        }
+        if (punch_holes_) {
+          // Make sure hole punching is supported for the directory.
+          // IMPALA-9798: this file should *not* be created inside impala-scratch
+          // subdirectory to avoid races with multiple impalads starting up.
+          RETURN_IF_ERROR(FileSystemUtil::CheckHolePunch(tmp_path.string()));
+        }
       }
     }
   }
@@ -306,7 +315,8 @@ void TmpFileMgr::NewFile(
   path new_file_path(tmp_dirs_[device_id].path);
   new_file_path /= file_name.str();
 
-  new_file->reset(new TmpFile(file_group, device_id, new_file_path.string()));
+  new_file->reset(new TmpFile(file_group, device_id, new_file_path.string(),
+      tmp_dirs_[device_id].expected_local));
 }
 
 string TmpFileMgr::GetTmpDirPath(DeviceId device_id) const {
@@ -329,13 +339,63 @@ vector<DeviceId> TmpFileMgr::ActiveTmpDevices() {
   return devices;
 }
 
-TmpFile::TmpFile(TmpFileGroup* file_group, DeviceId device_id, const string& path)
+TmpFile::TmpFile(TmpFileGroup* file_group, DeviceId device_id, const string& path,
+    bool expected_local, const char* hdfs_url)
   : file_group_(file_group),
     path_(path),
     device_id_(device_id),
     disk_id_(DiskInfo::disk_id(path.c_str())),
-    blacklisted_(false) {
+    expected_local_(expected_local),
+    blacklisted_(false),
+    done_(false),
+    in_mem_(true),
+    hdfs_url_(hdfs_url) {
   DCHECK(file_group != nullptr);
+  if (hdfs_url == nullptr) {
+    file_writer_ = make_unique<LocalFileWriter>();
+  } else {
+    hdfs_conn_ = nullptr;
+    // TODO: yidawu should open the connection somewhere else
+    if (IsHdfsPath(hdfs_url, false)) {
+      hdfs_conn_ = hdfsConnect("default", 0);
+    } else if (IsS3APath(hdfs_url, false)) {
+      string s3a_url = hdfs_url_;
+      string s3a_access_key;
+      string s3a_secret_key;
+      string s3a_session_token;
+      RunShellProcess("echo $S3A_ACCESS_KEY", &s3a_access_key);
+      RunShellProcess("echo $S3A_SECRET_KEY", &s3a_secret_key);
+      RunShellProcess("echo $S3A_SESSION_TOKEN", &s3a_session_token);
+      LOG(INFO) << "Open Connection with access key " << s3a_access_key;
+      LOG(INFO) << "Open Connection with secret key " << s3a_secret_key;
+      LOG(INFO) << "Open Connection with session token " << s3a_session_token;
+      hdfsBuilder* hdfs_builder = hdfsNewBuilder();
+      hdfsBuilderSetNameNode(hdfs_builder, s3a_url.c_str());
+      hdfsBuilderSetForceNewInstance(hdfs_builder);
+      hdfsBuilderConfSetStr(hdfs_builder, "fs.s3a.access.key", s3a_access_key.c_str());
+      hdfsBuilderConfSetStr(hdfs_builder, "fs.s3a.secret.key", s3a_secret_key.c_str());
+      hdfsBuilderConfSetStr(
+          hdfs_builder, "fs.s3a.session.token", s3a_session_token.c_str());
+      hdfs_conn_ = hdfsBuilderConnect(hdfs_builder);
+      if (hdfs_conn_ == nullptr) {
+        LOG(WARNING) << "Open Connection Failed " << s3a_url;
+      }
+    } else {
+      // Do nothing.
+    }
+    // TODO: yidawu need to new?
+    hdfs_url_.assign(hdfs_url);
+    file_writer_ = make_unique<HdfsFileWriter>(hdfs_conn_, expected_local);
+  }
+}
+
+TmpFile::~TmpFile() {
+  if (hdfs_conn_ != nullptr) {
+    int ret = hdfsDisconnect(hdfs_conn_);
+    if (ret != 0) {
+      // TODO: yidawu print something
+    }
+  }
 }
 
 bool TmpFile::AllocateSpace(int64_t num_bytes, int64_t* offset) {
@@ -344,15 +404,17 @@ bool TmpFile::AllocateSpace(int64_t num_bytes, int64_t* offset) {
   // Increment optimistically and roll back if the limit is exceeded.
   if (dir->bytes_used_metric->Increment(num_bytes) > dir->bytes_limit) {
     dir->bytes_used_metric->Increment(-num_bytes);
+    done_ = false;
     return false;
   }
   *offset = allocation_offset_;
   allocation_offset_ += num_bytes;
+  done_ = true;
   return true;
 }
 
 int TmpFile::AssignDiskQueue() const {
-  return file_group_->io_mgr_->AssignQueue(path_.c_str(), disk_id_, false);
+  return file_group_->io_mgr_->AssignQueue(path_.c_str(), disk_id_, expected_local_);
 }
 
 void TmpFile::Blacklist(const ErrorMsg& msg) {
@@ -368,6 +430,14 @@ Status TmpFile::Remove() {
       allocation_offset_;
   GetDir()->bytes_used_metric->Increment(-bytes_in_use);
   return status;
+}
+
+void TmpFile::Reset(WriteRange* range) {
+  // TODO: yidawu it will be set multiple times, not good
+  // DCHECK(write_range_ == nullptr);
+  if (write_range_ != nullptr) return;
+  write_range_ = range;
+  file_writer_->Reset(write_range_);
 }
 
 TmpFileMgr::TmpDir* TmpFile::GetDir() {
@@ -396,6 +466,71 @@ string TmpFile::DebugString() {
       this, path_, device_id_, disk_id_, allocation_offset_, blacklisted_);
 }
 
+void TmpFileRemote::FetchFromRemote() {
+  int ret;
+  int block_size = 1024 * 1024;
+  DCHECK(hdfs_conn_ != nullptr);
+  LOG(WARNING) << "In FetchFromRemote";
+
+  // Read the remote file to local buffer.
+  hdfsFile tmp_hdfs_file =
+      hdfsOpenFile(hdfs_conn_, path_.c_str(), O_RDONLY, 0, 0, block_size);
+  if (!is_in_memory()) {
+    // TODO: yidawu
+    ret = hdfsRead(hdfs_conn_, tmp_hdfs_file, write_buffer_, buffer_size_);
+  }
+  if (ret == -1) {
+    string error_msg = GetHdfsErrorMsg("");
+    LOG(WARNING) << "Failed to read data (length: " << buffer_size_
+                 << ") to Hdfs file: " << path_ << " " << error_msg;
+  }
+
+  ret = hdfsCloseFile(hdfs_conn_, tmp_hdfs_file);
+  if (ret != 0) {
+    LOG(WARNING) << GetHdfsErrorMsg("Failed to close HDFS file: ", path_);
+  }
+
+  // Write the buffer to local file
+  FILE* file;
+
+  // TODO: yidawu temp solution
+  io::WriteRange::WriteDoneCallback callback = [](const Status& status) {};
+
+  boost::scoped_ptr<WriteRange> write_range(
+      new WriteRange(path_local_.c_str(), 0, 0, callback));
+  write_range->SetData(write_buffer_, buffer_size_);
+
+  auto io_mgr = write_range_->io_ctx_->parent_;
+  Status status = io_mgr->local_file_system_->OpenForWrite(
+      path_local_.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR, &file);
+  status = io_mgr->WriteRangeHelper(file, write_range.get());
+  status = io_mgr->local_file_system_->Fclose(file, write_range.get());
+
+  SetRemote(false);
+  SetDumped();
+  LOG(WARNING) << "End FetchFromRemote, file dumped:" << path_local_;
+}
+
+bool TmpFileRemote::AllocateSpace(const MemRange& buffer, int64_t* offset) {
+  int64_t num_bytes = buffer.len();
+
+  DCHECK_GT(num_bytes, 0);
+
+  // TODO: yidawu add some used metircs
+  if (allocation_offset_ + num_bytes > buffer_size_) {
+    return false;
+  }
+  memcpy(write_buffer_ + allocation_offset_, buffer.data(), num_bytes);
+  *offset = allocation_offset_;
+  allocation_offset_ += num_bytes;
+  // TODO: yidawu assume page size are the same when using one tmpfilegroup
+  if (allocation_offset_ + num_bytes > buffer_size_) {
+    done_ = true;
+    buffer_ = write_buffer_;
+  }
+  return true;
+}
+
 TmpFileGroup::TmpFileGroup(TmpFileMgr* tmp_file_mgr, DiskIoMgr* io_mgr,
     RuntimeProfile* profile, const TUniqueId& unique_id, int64_t bytes_limit)
   : tmp_file_mgr_(tmp_file_mgr),
@@ -421,23 +556,6 @@ TmpFileGroup::TmpFileGroup(TmpFileMgr* tmp_file_mgr, DiskIoMgr* io_mgr,
     free_ranges_(64) {
   DCHECK(tmp_file_mgr != nullptr);
   io_ctx_ = io_mgr_->RegisterContext();
-  // Populate the priority based index ranges.
-  const std::vector<TmpDir>& tmp_dirs = tmp_file_mgr_->tmp_dirs_;
-  if (tmp_dirs.size() > 0) {
-    int start_index = 0;
-    int priority = tmp_dirs[0].priority;
-    for (int i = 0; i < tmp_dirs.size() - 1; ++i) {
-      priority = tmp_dirs[i].priority;
-      const int next_priority = tmp_dirs[i+1].priority;
-      if (next_priority != priority) {
-        tmp_files_index_range_.emplace(priority, TmpFileIndexRange(start_index, i));
-        start_index = i + 1;
-        priority = next_priority;
-      }
-    }
-    tmp_files_index_range_.emplace(priority,
-      TmpFileIndexRange(start_index, tmp_dirs.size() - 1));
-  }
 }
 
 TmpFileGroup::~TmpFileGroup() {
@@ -458,16 +576,9 @@ Status TmpFileGroup::CreateFiles() {
     ++files_allocated;
   }
   DCHECK_EQ(tmp_files_.size(), files_allocated);
-  DCHECK_EQ(tmp_file_mgr_->tmp_dirs_.size(), tmp_files_.size());
   if (tmp_files_.size() == 0) return ScratchAllocationFailedStatus({});
-  // Initialize the next allocation index for each priority.
-  for (const auto& entry: tmp_files_index_range_) {
-    const int priority = entry.first;
-    const int start = entry.second.start;
-    const int end = entry.second.end;
-    // Start allocating on a random device to avoid overloading the first device.
-    next_allocation_index_.emplace(priority, start + rand() % (end - start + 1));
-  }
+  // Start allocating on a random device to avoid overloading the first device.
+  next_allocation_index_ = rand() % tmp_files_.size();
   return Status::OK();
 }
 
@@ -501,6 +612,8 @@ static int64_t RoundUpToScratchRangeSize(bool punch_holes, int64_t bytes) {
   }
 }
 
+// TODO: yidawu integrate the function to the other one
+//  right now is only for testing
 Status TmpFileGroup::AllocateSpace(
     int64_t num_bytes, TmpFile** tmp_file, int64_t* file_offset) {
   lock_guard<SpinLock> lock(lock_);
@@ -528,31 +641,117 @@ Status TmpFileGroup::AllocateSpace(
   // that some disks were at capacity.
   vector<int> at_capacity_dirs;
 
-  // Find the next physical file in priority based round-robin order and allocate a range
-  // from it.
-  for (const auto& entry: tmp_files_index_range_) {
-    const int priority = entry.first;
-    const int start = entry.second.start;
-    const int end = entry.second.end;
-    DCHECK (0 <= start && start <= end && end < tmp_files_.size())
-      << "Invalid index range: [" << start << ", " << end << "] "
-      << "tmp_files_.size(): " << tmp_files_.size();
-    for (int index = start; index <= end; ++index) {
-      const int idx = next_allocation_index_[priority];
-      next_allocation_index_[priority] = start + (idx - start + 1) % (end - start + 1);
-      *tmp_file = tmp_files_[idx].get();
-      if ((*tmp_file)->is_blacklisted()) continue;
+  // Find the next physical file in round-robin order and allocate a range from it.
+  for (int attempt = 0; attempt < tmp_files_.size(); ++attempt) {
+    int idx = next_allocation_index_;
+    next_allocation_index_ = (next_allocation_index_ + 1) % tmp_files_.size();
+    *tmp_file = tmp_files_[idx].get();
+    if ((*tmp_file)->is_blacklisted()) continue;
 
-      // Check the per-directory limit.
-      if (!(*tmp_file)->AllocateSpace(scratch_range_bytes, file_offset)) {
-        at_capacity_dirs.push_back(idx);
-        continue;
+    // Check the per-directory limit.
+    if (!(*tmp_file)->AllocateSpace(scratch_range_bytes, file_offset)) {
+      at_capacity_dirs.push_back(idx);
+      continue;
+    }
+    scratch_space_bytes_used_counter_->Add(scratch_range_bytes);
+    tmp_file_mgr_->scratch_bytes_used_metric_->Increment(scratch_range_bytes);
+    current_bytes_allocated_ += scratch_range_bytes;
+    return Status::OK();
+  }
+  return ScratchAllocationFailedStatus(at_capacity_dirs);
+}
+
+Status TmpFileGroup::AllocateSpace(
+    const MemRange& buffer, TmpFile** tmp_file, int64_t* file_offset) {
+  int64_t num_bytes = buffer.len();
+
+  lock_guard<SpinLock> lock(lock_);
+  // TODO: yidawu only one dir supported, need multiple dirs support
+  if (!tmp_file_mgr_->tmp_dirs_.empty()) {
+    if (IsHdfsPath(tmp_file_mgr_->tmp_dirs_[0].path.c_str(), false)
+        || IsS3APath(tmp_file_mgr_->tmp_dirs_[0].path.c_str(), false)) {
+      if (tmp_file_remote_ != nullptr) {
+        // TODO: yidawu recheck num_bytes, should be scratch_range_bytes
+        if (tmp_file_remote_->AllocateSpace(buffer, file_offset)) {
+          *tmp_file = (TmpFile*)tmp_file_remote_;
+          return Status::OK();
+        }
       }
-      scratch_space_bytes_used_counter_->Add(scratch_range_bytes);
-      tmp_file_mgr_->scratch_bytes_used_metric_->Increment(scratch_range_bytes);
-      current_bytes_allocated_ += scratch_range_bytes;
+
+      string unique_name = lexical_cast<string>(random_generator()());
+      stringstream file_name;
+      /*string dir = "hdfs://localhost:20500/tmp" ;
+      if (IsS3APath(tmp_file_mgr_->tmp_dirs_[0].path.c_str(), false) ) {
+        dir = "s3a://aws-logs-368744652834-us-east-1" ;
+      }*/
+      string dir = tmp_file_mgr_->tmp_dirs_[0].path;
+      if (IsHdfsPath(tmp_file_mgr_->tmp_dirs_[0].path.c_str(), false)) {
+        // TODO: yidawu hdfs only support hdfs://localhost so far
+        dir.append(":20500/tmp");
+      }
+      string dir_local = "/tmp";
+      file_name << "disk_io_mgr_test_" << unique_name;
+      path new_file_path(dir);
+      path new_file_path_local(dir_local);
+      new_file_path /= file_name.str();
+      new_file_path_local /= file_name.str();
+      auto tmp_file_remote = new TmpFileRemote(
+          this, io_mgr_->RemoteDfsDiskId(), new_file_path.string(), false, dir.c_str());
+      LOG(WARNING) << "tmp file dir:" << dir << " file path:" << new_file_path.string();
+      if (!tmp_file_remote->AllocateSpace(buffer, file_offset)) {
+        // TODO: yidawu return error
+        return Status::MemLimitExceeded();
+      }
+      tmp_file_remote->SetLocalPath(new_file_path_local.string());
+      tmp_file_remote_ = tmp_file_remote;
+      *tmp_file = (TmpFile*)tmp_file_remote_;
+      *file_offset = 0;
       return Status::OK();
     }
+  }
+
+  int64_t scratch_range_bytes =
+      RoundUpToScratchRangeSize(tmp_file_mgr_->punch_holes(), num_bytes);
+  int free_ranges_idx = BitUtil::Log2Ceiling64(scratch_range_bytes);
+  if (!free_ranges_[free_ranges_idx].empty()) {
+    DCHECK(!tmp_file_mgr_->punch_holes()) << "Ranges not recycled when punching holes";
+    *tmp_file = free_ranges_[free_ranges_idx].back().first;
+    *file_offset = free_ranges_[free_ranges_idx].back().second;
+    free_ranges_[free_ranges_idx].pop_back();
+    return Status::OK();
+  }
+
+  if (bytes_limit_ != -1
+      && current_bytes_allocated_ + scratch_range_bytes > bytes_limit_) {
+    return Status(TErrorCode::SCRATCH_LIMIT_EXCEEDED, bytes_limit_, GetBackendString());
+  }
+
+  // Lazily create the files on the first write.
+  if (tmp_files_.empty()) RETURN_IF_ERROR(CreateFiles());
+
+  // Track the indices of any directories where we failed due to capacity. This is
+  // required for error reporting if we are totally out of capacity so that it's clear
+  // that some disks were at capacity.
+  vector<int> at_capacity_dirs;
+
+  // Find the next physical file in round-robin order and allocate a range from it.
+  for (int attempt = 0; attempt < tmp_files_.size(); ++attempt) {
+    int idx = next_allocation_index_;
+    next_allocation_index_ = (next_allocation_index_ + 1) % tmp_files_.size();
+    *tmp_file = tmp_files_[idx].get();
+    if ((*tmp_file)->is_blacklisted()) continue;
+
+    // Check the per-directory limit.
+    if (!(*tmp_file)->AllocateSpace(scratch_range_bytes, file_offset)) {
+      at_capacity_dirs.push_back(idx);
+      continue;
+    }
+    (*tmp_file)->buffer_ = buffer.data();
+
+    scratch_space_bytes_used_counter_->Add(scratch_range_bytes);
+    tmp_file_mgr_->scratch_bytes_used_metric_->Increment(scratch_range_bytes);
+    current_bytes_allocated_ += scratch_range_bytes;
+    return Status::OK();
   }
   return ScratchAllocationFailedStatus(at_capacity_dirs);
 }
@@ -631,11 +830,25 @@ Status TmpFileGroup::ReadAsync(TmpWriteHandle* handle, MemRange buffer) {
   // Don't grab handle->write_state_lock_, it is safe to touch all of handle's state
   // since the write is not in flight.
   handle->read_range_ = scan_range_pool_.Add(new ScanRange);
-  handle->read_range_->Reset(nullptr, handle->write_range_->file(),
-      handle->write_range_->len(), handle->write_range_->offset(),
-      handle->write_range_->disk_id(), false, false, ScanRange::INVALID_MTIME,
-      BufferOpts::ReadInto(
-          read_buffer.data(), read_buffer.len(), BufferOpts::NO_CACHING));
+
+  if (handle->write_range_->disk_id() == io_mgr_->RemoteDfsDiskId()
+      || handle->write_range_->disk_id() == io_mgr_->RemoteS3DiskId()) {
+    // TODO: yidawu set mtime
+    int mtime = 100000;
+    TmpFileRemote* tmp_file = (TmpFileRemote*)(handle->write_range_->tmpfile());
+    // TODO: yidawu disk id/path/len
+    handle->read_range_->Reset(nullptr, tmp_file->LocalPath().c_str(),
+        handle->write_range_->len(), handle->write_range_->offset(), 0, false, false,
+        mtime, BufferOpts::ReadInto(
+                   read_buffer.data(), read_buffer.len(), BufferOpts::NO_CACHING),
+        nullptr, tmp_file);
+  } else {
+    handle->read_range_->Reset(nullptr, handle->write_range_->file(),
+        handle->write_range_->len(), handle->write_range_->offset(),
+        handle->write_range_->disk_id(), false, false, ScanRange::INVALID_MTIME,
+        BufferOpts::ReadInto(
+            read_buffer.data(), read_buffer.len(), BufferOpts::NO_CACHING));
+  }
   read_counter_->Add(1);
   bytes_read_counter_->Add(read_buffer.len());
   bool needs_buffers;
@@ -795,12 +1008,7 @@ string TmpFileGroup::DebugString() {
   stringstream ss;
   ss << "TmpFileGroup " << this << " bytes limit " << bytes_limit_
      << " current bytes allocated " << current_bytes_allocated_
-     << " next allocation index [ ";
-  // Get priority based allocation index.
-  for (const auto& entry: next_allocation_index_) {
-    ss << " (priority: " << entry.first << ", index: " << entry.second << "), ";
-  }
-  ss << "] writes "
+     << " next allocation index " << next_allocation_index_ << " writes "
      << write_counter_->value() << " bytes written " << bytes_written_counter_->value()
      << " uncompressed bytes written " << uncompressed_bytes_written_counter_->value()
      << " reads " << read_counter_->value() << " bytes read "
@@ -825,6 +1033,8 @@ TmpWriteHandle::~TmpWriteHandle() {
   DCHECK(!write_in_flight_);
   DCHECK(read_range_ == nullptr);
   DCHECK(compressed_.buffer() == nullptr);
+  // TODO: yidawu recheck
+  // if(file_ != nullptr) delete file_ ;
 }
 
 string TmpWriteHandle::TmpFilePath() const {
@@ -850,14 +1060,14 @@ Status TmpWriteHandle::Write(RequestContext* io_ctx, MemRange buffer,
       if (!write_started) FreeCompressedBuffer();
   });
 
-  // Allocate space after doing compression, to avoid overallocating space.
-  TmpFile* tmp_file;
-  int64_t file_offset;
-  RETURN_IF_ERROR(parent_->AllocateSpace(buffer_to_write.len(), &tmp_file, &file_offset));
-
   if (FLAGS_disk_spill_encryption) {
     RETURN_IF_ERROR(EncryptAndHash(buffer_to_write, counters));
   }
+
+  // Allocate space after doing compression, to avoid overallocating space.
+  TmpFile* tmp_file;
+  int64_t file_offset;
+  RETURN_IF_ERROR(parent_->AllocateSpace(buffer_to_write, &tmp_file, &file_offset));
 
   // Set all member variables before calling AddWriteRange(): after it succeeds,
   // WriteComplete() may be called concurrently with the remainder of this function.
@@ -866,9 +1076,14 @@ Status TmpWriteHandle::Write(RequestContext* io_ctx, MemRange buffer,
   write_range_.reset(new WriteRange(
       tmp_file->path(), file_offset, tmp_file->AssignDiskQueue(), callback));
   write_range_->SetData(buffer_to_write.data(), buffer_to_write.len());
+  write_range_->SetTmpFile(tmp_file);
+  write_range_->SetRequestContext(io_ctx);
   VLOG(3) << "Write " << tmp_file->path() << " " << file_offset << " "
           << buffer_to_write.len();
   write_in_flight_ = true;
+
+  tmp_file->Reset(write_range_.get());
+
   Status status = io_ctx->AddWriteRange(write_range_.get());
   if (!status.ok()) {
     // The write will not be in flight if we returned with an error.
@@ -1042,4 +1257,13 @@ string TmpWriteHandle::DebugString() {
   }
   return ss.str();
 }
+
+/*
+void* TmpFileRemoteConnections::GetConnection(string path) {
+  auto conn = connections_.find(path);
+  if(conn != connections_.end()) return conn->second;
+  // Create a connection if it doesn't exist
+
+}*/
+
 } // namespace impala

@@ -223,6 +223,10 @@ class RequestContext {
   friend class DiskIoMgr;
   friend class ScanRange;
   friend class HdfsFileReader;
+  friend class WriteRange;
+  friend class impala::TmpFileRemote;
+  friend class HdfsFileWriter;
+  friend class LocalFileWriter;
 
   enum State {
     /// Reader is initialized and maps to a client

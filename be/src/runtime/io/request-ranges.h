@@ -32,11 +32,14 @@
 #include "util/internal-queue.h"
 
 namespace impala {
+class TmpFile;
+class TmpFileRemote;
 namespace io {
 class DiskIoMgr;
 class DiskQueue;
 class ExclusiveHdfsFileHandle;
 class FileReader;
+class FileWriter;
 class RequestContext;
 class ScanRange;
 
@@ -272,14 +275,15 @@ class ScanRange : public RequestRange {
   /// successfully reading to eos.
   void Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset, int disk_id,
       bool expected_local, bool is_erasure_coded, int64_t mtime,
-      const BufferOpts& buffer_opts, void* meta_data = nullptr);
+      const BufferOpts& buffer_opts, void* meta_data = nullptr,
+      TmpFile* tmpfile = nullptr);
 
   /// Same as above, but it also adds sub-ranges. No need to merge contiguous sub-ranges
   /// in advance, as this method will do the merge.
   void Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset, int disk_id,
       bool expected_local, bool is_erasure_coded, int64_t mtime,
       const BufferOpts& buffer_opts, std::vector<SubRange>&& sub_ranges,
-      void* meta_data = nullptr);
+      void* meta_data = nullptr, TmpFile* tmpfile = nullptr);
 
   void* meta_data() const { return meta_data_; }
   int cache_options() const { return cache_options_; }
@@ -567,6 +571,9 @@ class ScanRange : public RequestRange {
   /// If not empty, the ScanRange will only read these parts from the file.
   std::vector<SubRange> sub_ranges_;
 
+  // TODO: yidawu prototype
+  TmpFile* tmp_file_ = nullptr;
+
   // Read position in the sub-ranges.
   struct SubRangePosition {
     /// Index of SubRange in 'ScanRange::sub_ranges_' to read next
@@ -611,17 +618,35 @@ class WriteRange : public RequestRange {
   /// is called or after the write callback was called).
   void SetData(const uint8_t* buffer, int64_t len);
 
+  void SetTmpFile(TmpFile* tmp_file) { tmp_file_ = tmp_file; }
+
+  void SetRequestContext(RequestContext* io_ctx) { io_ctx_ = io_ctx; }
+
+  Status DoWrite();
+
   const uint8_t* data() const { return data_; }
+
+  TmpFile* tmpfile() const { return tmp_file_; }
+
   WriteDoneCallback callback() const { return callback_; }
 
  private:
   DISALLOW_COPY_AND_ASSIGN(WriteRange);
+
+  friend class impala::TmpFileRemote;
+  friend class HdfsFileWriter;
+  friend class LocalFileWriter;
+
   /// Data to be written. RequestRange::len_ contains the length of data
   /// to be written.
   const uint8_t* data_;
 
   /// Callback to invoke after the write is complete.
   WriteDoneCallback callback_;
+
+  RequestContext* io_ctx_;
+
+  TmpFile* tmp_file_;
 };
 
 inline bool BufferDescriptor::is_cached() const {

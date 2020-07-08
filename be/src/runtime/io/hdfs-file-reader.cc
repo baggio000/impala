@@ -95,6 +95,7 @@ Status HdfsFileReader::ReadFromPos(DiskQueue* queue, int64_t file_offset, uint8_
   auto request_context = scan_range_->reader_;
   *eof = false;
   *bytes_read = 0;
+  Status status = Status::OK();
 
   CachedHdfsFileHandle* borrowed_hdfs_fh = nullptr;
   hdfsFile hdfs_file;
@@ -117,7 +118,6 @@ Status HdfsFileReader::ReadFromPos(DiskQueue* queue, int64_t file_offset, uint8_
     }
   });
 
-  Status status = Status::OK();
   {
     ScopedTimer<MonotonicStopWatch> req_context_read_timer(
         scan_range_->reader_->read_timer_);

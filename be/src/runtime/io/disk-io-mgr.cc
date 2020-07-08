@@ -18,14 +18,22 @@
 #include "runtime/io/disk-io-mgr.h"
 
 #include "common/global-flags.h"
+#include "common/names.h"
 #include "common/thread-debug-info.h"
 #include "runtime/exec-env.h"
+#include "runtime/hdfs-fs-cache.h"
 #include "runtime/io/data-cache.h"
 #include "runtime/io/disk-io-mgr-internal.h"
-#include "runtime/io/handle-cache.inline.h"
 #include "runtime/io/error-converter.h"
+#include "runtime/io/file-writer.h"
+#include "runtime/io/handle-cache.inline.h"
+#include "runtime/tmp-file-mgr-internal.h"
 
 #include <boost/algorithm/string.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/lexical_cast.hpp>
+#include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/uuid_io.hpp>
 
 #include "gutil/strings/substitute.h"
 #include "util/bit-util.h"
@@ -35,6 +43,7 @@
 #include "util/hdfs-util.h"
 #include "util/histogram-metric.h"
 #include "util/metrics.h"
+#include "util/os-util.h"
 #include "util/test-info.h"
 #include "util/time.h"
 
@@ -49,6 +58,8 @@ using namespace impala::io;
 using namespace strings;
 
 using std::to_string;
+using boost::uuids::random_generator;
+using boost::filesystem::path;
 
 // Control the number of disks on the machine.  If 0, this comes from the system
 // settings.
@@ -170,6 +181,7 @@ static const char* WRITE_IO_ERR_METRIC_KEY_TEMPLATE =
     "impala-server.io-mgr.queue-$0.write-io-error";
 
 AtomicInt32 DiskIoMgr::next_disk_id_;
+hdfsFS hdfs_connection_ = nullptr;
 
 string DiskIoMgr::DebugString() {
   stringstream ss;
@@ -197,6 +209,46 @@ void WriteRange::SetRange(
 void WriteRange::SetData(const uint8_t* buffer, int64_t len) {
   data_ = buffer;
   len_ = len;
+}
+
+Status WriteRange::DoWrite() {
+  if (!tmp_file_->is_done() || tmp_file_->len() != offset_ + len_) {
+    // The data has been cached for remote file writing
+    LOG(WARNING) << "tmpfile:" << tmp_file_->is_done() << " " << tmp_file_->len()
+                 << " write range:" << offset_ << " " << len_ << " name:" << file()
+                 << " skip";
+    return Status::OK();
+  }
+
+  Status ret_status = Status::OK();
+  Status close_status = Status::OK();
+  DiskQueue* queue = io_ctx_->parent_->disk_queues_[disk_id_];
+
+  {
+    ScopedHistogramTimer write_timer(queue->write_latency());
+    ret_status = tmp_file_->file_writer_->Open();
+    if (!ret_status.ok()) goto end;
+    ret_status = tmp_file_->file_writer_->Write();
+    close_status = tmp_file_->file_writer_->Close();
+    if (ret_status.ok() && !close_status.ok()) ret_status = close_status;
+    if (ret_status.ok()) {
+      // tmp_file_->SetDumped() ;
+      // TODO: yidawu only for test, local file should be deleted somewhere else
+      tmp_file_->SetDumped(false);
+      tmp_file_->SetRemote();
+      tmp_file_->SetInMemory(false);
+      LOG(WARNING) << "tmpfile:" << tmp_file_->is_done() << " " << tmp_file_->len()
+                   << " name:" << tmp_file_->path() << " dumped";
+    }
+  }
+
+end:
+  if (ret_status.ok()) {
+    queue->write_size()->Update(tmp_file_->len());
+  } else {
+    queue->write_io_err()->Increment(1);
+  }
+  return ret_status;
 }
 
 static void CheckSseSupport() {
@@ -547,42 +599,18 @@ void DiskQueue::DiskThreadLoop(DiskIoMgr* io_mgr) {
       worker_context->ReadDone(disk_id_, outcome, scan_range);
     } else {
       DCHECK(range->request_type() == RequestType::WRITE);
-      io_mgr->Write(worker_context, static_cast<WriteRange*>(range));
+      // io_mgr->Write(worker_context, static_cast<WriteRange*>(range));
+      WriteRange* write_range = static_cast<WriteRange*>(range);
+      Status status = write_range->DoWrite();
+      worker_context->WriteDone(write_range, status);
     }
   }
 }
 
-void DiskIoMgr::Write(RequestContext* writer_context, WriteRange* write_range) {
-  Status ret_status = Status::OK();
-  FILE* file_handle = nullptr;
-  Status close_status = Status::OK();
-  DiskQueue* queue = disk_queues_[write_range->disk_id()];
-
-  {
-    ScopedHistogramTimer write_timer(queue->write_latency());
-    ret_status = local_file_system_->OpenForWrite(
-        write_range->file(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR, &file_handle);
-    if (!ret_status.ok()) goto end;
-
-    ret_status = WriteRangeHelper(file_handle, write_range);
-
-    close_status = local_file_system_->Fclose(file_handle, write_range);
-    if (ret_status.ok() && !close_status.ok()) ret_status = close_status;
-  }
-
-end:
-  if (ret_status.ok()) {
-    queue->write_size()->Update(write_range->len());
-  } else {
-    queue->write_io_err()->Increment(1);
-  }
-  writer_context->WriteDone(write_range, ret_status);
-}
-
 Status DiskIoMgr::WriteRangeHelper(FILE* file_handle, WriteRange* write_range) {
   // Seek to the correct offset and perform the write.
-  RETURN_IF_ERROR(local_file_system_->Fseek(file_handle, write_range->offset(), SEEK_SET,
-      write_range));
+  RETURN_IF_ERROR(local_file_system_->Fseek(
+      file_handle, write_range->offset(), SEEK_SET, write_range));
 
 #ifndef NDEBUG
   if (FLAGS_stress_scratch_write_delay_ms > 0) {

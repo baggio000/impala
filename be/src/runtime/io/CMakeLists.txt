@@ -30,6 +30,8 @@ add_library(Io
   error-converter.cc
   request-context.cc
   scan-range.cc
+  hdfs-file-writer.cc
+  local-file-writer.cc
   hdfs-file-reader.cc
   local-file-reader.cc
   hdfs-monitored-ops.cc

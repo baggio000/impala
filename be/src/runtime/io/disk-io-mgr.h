@@ -37,9 +37,8 @@
 #include "util/thread.h"
 
 namespace impala {
-
+class TmpFileRemote;
 namespace io {
-
 class DataCache;
 class DiskQueue;
 
@@ -278,7 +277,7 @@ class DiskIoMgr : public CacheLineAligned {
   /// disk_queues_.  The disk_id is the volume ID for the local disk that holds the
   /// files, or -1 if unknown.  Flag expected_local is true iff this impalad is
   /// co-located with the datanode for this file.
-  int AssignQueue(const char* file, int disk_id, bool expected_local);
+  int AssignQueue(const char* file, int disk_id, bool expected_local = false);
 
   int64_t min_buffer_size() const { return min_buffer_size_; }
   int64_t max_buffer_size() const { return max_buffer_size_; }
@@ -387,11 +386,11 @@ class DiskIoMgr : public CacheLineAligned {
   /// BEGIN: private members that are accessed by other io:: classes
   friend class DiskQueue;
   friend class ScanRange;
+  friend class WriteRange;
   friend class HdfsFileReader;
-
-  /// Write the specified range to disk and calls writer_context->WriteDone() when done.
-  /// Responsible for opening and closing the file that is written.
-  void Write(RequestContext* writer_context, WriteRange* write_range);
+  friend class impala::TmpFileRemote;
+  friend class HdfsFileWriter;
+  friend class LocalFileWriter;
 
   struct hadoopRzOptions* cached_read_options() { return cached_read_options_; }
 
