@@ -307,6 +307,7 @@ public class StmtRewriter {
       boolean updateSelectList = false;
       SelectStmt subqueryStmt = (SelectStmt) expr.getSubquery().getStatement();
       boolean isScalarSubquery = expr.getSubquery().isScalarSubquery();
+      boolean isScalarColumn = expr.getSubquery().returnsScalarColumn();
       boolean isRuntimeScalar = subqueryStmt.isRuntimeScalar();
       // Create a new inline view from the subquery stmt. The inline view will be added
       // to the stmt's table refs later. Explicitly set the inline view's column labels
@@ -460,11 +461,17 @@ public class StmtRewriter {
       }
 
       if (!hasEqJoinPred && !inlineView.isCorrelated()) {
-        // TODO: Remove this when independent subquery evaluation is implemented.
         // TODO: Requires support for non-equi joins.
+        // TODO: Remove this when independent subquery evaluation is implemented.
+        // TODO: IMPALA-5100 to cover all cases, we do let through runtime scalars with
+        // group by clauses to allow for subqueries where we haven't implemented plan time
+        // expression evaluation to ensure only a single row is returned. This may expose
+        // runtime errors in the presence of multiple runtime scalar subqueries until we
+        // implement independent evaluation.
         boolean hasGroupBy = ((SelectStmt) inlineView.getViewStmt()).hasGroupByClause();
-        if ((!isScalarSubquery && !isRuntimeScalar) ||
-            (hasGroupBy && !stmt.selectList_.isDistinct())) {
+        if ((!isScalarSubquery && !isRuntimeScalar)
+            || (hasGroupBy && !stmt.selectList_.isDistinct() && !isScalarColumn
+                   && !isRuntimeScalar)) {
           throw new AnalysisException(
               "Unsupported predicate with subquery: " + expr.toSql());
         }
@@ -808,11 +815,7 @@ public class StmtRewriter {
           new SelectList(items, isDistinct, stmt.selectList_.getPlanHints());
       // Update subquery's GROUP BY clause
       if (groupByExprs != null && !groupByExprs.isEmpty()) {
-        if (stmt.hasGroupByClause()) {
-          stmt.groupingExprs_.addAll(groupByExprs);
-        } else {
-          stmt.groupingExprs_ = groupByExprs;
-        }
+        stmt.addGroupingExprs(groupByExprs);
       }
     }
 
@@ -934,12 +937,22 @@ public class StmtRewriter {
 
     /**
      * Rewrite all the subqueries of a SelectStmt in place. Subqueries are currently
-     * supported in FROM and WHERE clauses. The rewrite is performed in place and not in a
-     * clone of SelectStmt because it requires the stmt to be analyzed.
+     * supported in the FROM clause, WHERE clause and SELECT list. The rewrite is
+     * performed in place and not in a clone of SelectStmt because it requires the stmt to
+     * be analyzed.
      */
     @Override
     protected void rewriteSelectStmtHook(SelectStmt stmt, Analyzer analyzer)
         throws AnalysisException {
+      // Rewrite all the subqueries in the HAVING clause.
+      if (stmt.hasHavingClause() && stmt.havingClause_.getSubquery() != null) {
+        if (hasSubqueryInDisjunction(stmt.havingClause_)) {
+          throw new AnalysisException("Subqueries in OR predicates are not supported: "
+              + stmt.havingClause_.toSql());
+        }
+        rewriteHavingClauseSubqueries(stmt, analyzer);
+      }
+
       // Rewrite all the subqueries in the WHERE clause.
       if (stmt.hasWhereClause()) {
         // Push negation to leaf operands.
@@ -952,6 +965,7 @@ public class StmtRewriter {
         }
         rewriteWhereClauseSubqueries(stmt, analyzer);
       }
+      rewriteSelectListSubqueries(stmt, analyzer);
     }
 
     /**
@@ -1095,6 +1109,282 @@ public class StmtRewriter {
       ExprSubstitutionMap smap = new ExprSubstitutionMap();
       smap.put(subquery, newSubquery);
       return expr.substitute(smap, analyzer, false);
+    }
+
+    /**
+     * Rewrite subqueries of a stmt's SELECT list. Scalar subqueries are the only type
+     * of subquery supported in the select list.  Scalar subqueries return a single column
+     * and at most 1 row, a runtime error should be thrown if more than one row is
+     * returned. Generally these subqueries can be evaluated once for every row of the
+     * outer query however for performance reasons we want to rewrite evaluation to use
+     * joins where possible.
+     *
+     * 1) Uncorrelated Scalar Aggregate Query
+     *
+     *    SELECT T1.a, (SELECT avg(T2.a) from T2) FROM T1;
+     *
+     *    This is implemented by flattening into a join.
+     *
+     *    SELECT T1.a, $a$1.$c$1 FROM T1, (SELECT avg(T2.a) $c$1 FROM T2) $a$1
+     *
+     *    Currently we only support very simple subqueries which return a single aggregate
+     *    function with no group by columns unless a LIMIT 1 is given. TODO: IMPALA-1285
+     *
+     * 2) Correlated Scalar Aggregate
+     *
+     *    TODO: IMPALA-8955
+     *    SELECT id, (SELECT count(*) FROM T2 WHERE id=a.id ) FROM T1 a
+     *
+     *    This can be flattened with a LEFT OUTER JOIN
+     *
+     *    SELECT T1.a, $a$1.$c$1 FROM T1 LEFT OUTER JOIN
+     *      (SELECT id, count(*) $c$1 FROM T2 GROUP BY id) $a$1 ON T1.id = $a$1.id
+     *
+     * 3) Correlated Scalar
+     *
+     *    TODO: IMPALA-6315
+     *    SELECT id, (SELECT cost FROM T2 WHERE id=a.id ) FROM T1 a
+     *
+     *    In this case there is no aggregate function to guarantee only a single row is
+     *    returned per group so a run time cardinality check must be applied. An exception
+     *    would be if the correlated predicates had primary key constraints.
+     *
+     * 4) Runtime Scalar Subqueries
+     *
+     *    TODO: IMPALA-5100
+     *    We do have a {@link CardinalityCheckNode} for runtime checks however queries
+     *    can't always be rewritten into an NLJ without special care. For example with
+     *    conditional expression like below:
+     *
+     *    SELECT T1.a,
+     *      IF((SELECT max(T2.a) from T2 > 10,
+     *         (SELECT T2.a from T2 WHERE id=T1.id),
+     *         (SELECT T3.a from T2 WHERE if=T1.id)
+     *    FROM T1;
+     *
+     *    If rewritten to joins with cardinality checks then both legs of the conditional
+     *    expression would be evaluated regardless of the condition. If the false case
+     *    were to return a runtime error while when the true doesn't and the condition
+     *    evaluates to true then we'd have incorrect behavior.
+     */
+    private void rewriteSelectListSubqueries(SelectStmt stmt, Analyzer analyzer)
+        throws AnalysisException {
+      Preconditions.checkNotNull(stmt);
+      Preconditions.checkNotNull(analyzer);
+      final int numTableRefs = stmt.fromClause_.size();
+      final boolean parentHasAgg = stmt.hasMultiAggInfo();
+      // Track any new inline views so we later ensure they are rewritten if needed.
+      // An improvement would be to have a pre/post order abstract rewriter class.
+      final List<InlineViewRef> newViews = new ArrayList<>();
+      for (SelectListItem selectItem : stmt.getSelectList().getItems()) {
+        if (selectItem.isStar()) {
+          continue;
+        }
+
+        final Expr expr = selectItem.getExpr();
+        final List<Subquery> subqueries = new ArrayList<>();
+        // Use collect as opposed to collectAll in order to allow nested subqueries to be
+        // rewritten as needed. For example a subquery in the select list which contains
+        // its own subquery in the where clause.
+        expr.collect(Predicates.instanceOf(Subquery.class), subqueries);
+        if (subqueries.size() == 0) {
+          continue;
+        }
+        final ExprSubstitutionMap smap = new ExprSubstitutionMap();
+        for (Subquery sq : subqueries) {
+          final SelectStmt subqueryStmt = (SelectStmt) sq.getStatement();
+          // TODO: Handle correlated subqueries IMPALA-8955
+          if (isCorrelated(subqueryStmt)) {
+            throw new AnalysisException("A correlated scalar subquery is not supported "
+                + "in the expression: " + expr.toSql());
+          }
+          Preconditions.checkState(sq.getType().isScalarType());
+
+          // Existential subqueries in Impala aren't really execution time expressions,
+          // they are either checked at plan time or expected to be handled by the
+          // subquery rewrite into a join. In the case of the select list we will only
+          // support plan time evaluation.
+          boolean replacedExists = false;
+          final List<ExistsPredicate> existsPredicates = new ArrayList<>();
+          expr.collect(ExistsPredicate.class, existsPredicates);
+          for (ExistsPredicate ep : existsPredicates) {
+            // Check to see if the current subquery is the child of an exists predicate.
+            if (ep.contains(sq)) {
+              final BoolLiteral boolLiteral = replaceExistsPredicate(ep);
+              if (boolLiteral != null) {
+                boolLiteral.analyze(analyzer);
+                smap.put(ep, boolLiteral);
+                replacedExists = true;
+                break;
+              } else {
+                throw new AnalysisException(
+                    "Unsupported subquery with runtime scalar check: " + ep.toSql());
+              }
+            }
+          }
+          if (replacedExists) {
+            continue;
+          }
+
+          List<String> colLabels = new ArrayList<>();
+          for (int i = 0; i < subqueryStmt.getColLabels().size(); ++i) {
+            colLabels.add(subqueryStmt.getColumnAliasGenerator().getNextAlias());
+          }
+          // Create a new inline view from the subquery stmt aliasing the columns.
+          InlineViewRef inlineView = new InlineViewRef(
+              stmt.getTableAliasGenerator().getNextAlias(), subqueryStmt, colLabels);
+          inlineView.reset();
+          inlineView.analyze(analyzer);
+
+          // For uncorrelated scalar subqueries we rewrite with a CROSS_JOIN. This makes
+          // it simpler to further optimize by merging subqueries without worrying about
+          // join ordering as in IMPALA-9796. For correlated subqueries we'd want to
+          // rewrite to a LOJ.
+          inlineView.setJoinOp(JoinOperator.CROSS_JOIN);
+          stmt.fromClause_.add(inlineView);
+          newViews.add(inlineView);
+
+          SlotRef slotRef = new SlotRef(Lists.newArrayList(
+              inlineView.getUniqueAlias(), inlineView.getColLabels().get(0)));
+          slotRef.analyze(analyzer);
+          Expr substitute = slotRef;
+          // Need to wrap the expression with a no-op aggregate function if the stmt does
+          // any aggregation, using MAX() given no explicit function to return any value
+          // in a group.
+          if (parentHasAgg) {
+            final FunctionCallExpr aggWrapper =
+                new FunctionCallExpr("max", Lists.newArrayList((Expr) slotRef));
+            aggWrapper.analyze(analyzer);
+            substitute = aggWrapper;
+          }
+          // Substitute original subquery expression with a reference to the inline view.
+          smap.put(sq, substitute);
+        }
+        // Update select list with any new slot references.
+        selectItem.setExpr(expr.substitute(smap, analyzer, false));
+      }
+      // Rewrite any new views
+      for (InlineViewRef v : newViews) {
+        rewriteQueryStatement(v.getViewStmt(), v.getAnalyzer());
+      }
+      // Only applies to the original list of TableRefs, not any as a result of the
+      // rewrite.
+      if (!newViews.isEmpty()) {
+        replaceUnqualifiedStarItems(stmt, numTableRefs);
+      }
+    }
+
+    /**
+     * Rewrite subqueries of a stmt's HAVING clause. The stmt is rewritten into two
+     * separate statements; an inner statement which performs all sql operations that
+     * evaluated before the HAVING clause and an outer statement which projects the inner
+     * stmt's results with the HAVING clause rewritten as a WHERE clause and also performs
+     * the remainder of the sql operations (ORDER BY, LIMIT). We then rely on the WHERE
+     * clause rewrite rule to handle the subqueries that were originally in the HAVING
+     * clause.
+     *
+     * SELECT a, sum(b) FROM T1 GROUP BY a HAVING count(b) > (SELECT max(c) FROM T2)
+     * ORDER BY 2 LIMIT 10
+     *
+     * Inner Stmt becomes:
+     *
+     * SELECT a, sum(b), count(b) FROM T1 GROUP BY a
+     *
+     * Notice we augment the select list with any aggregates in the HAVING clause that are
+     * missing in the original select list.
+     *
+     * Outer Stmt becomes:
+     *
+     * SELECT $a$1.$c$1 a, $a$1.$c$2 sum(b) FROM
+     * (SELECT a, sum(b), count(b) FROM T1 GROUP BY a) $a$1 ($c$1, $c$2, $c$3) WHERE
+     * $a$1.$c$3 > (SELECT max(c) FROM T2) ORDER BY 2 LIMIT 10
+     *
+     * The query should would then be rewritten by the caller using
+     * rewriteWhereClauseSubqueries()
+     *
+     */
+    private void rewriteHavingClauseSubqueries(SelectStmt stmt, Analyzer analyzer)
+        throws AnalysisException {
+      // Generate the inner query from the current statement pulling up the order by,
+      // limit, and any aggregates in the having clause that aren't projected in the
+      // select list.
+      final SelectStmt innerStmt = stmt.clone();
+      final List<FunctionCallExpr> aggExprs = stmt.hasMultiAggInfo() ?
+          stmt.getMultiAggInfo().getAggExprs() :
+          new ArrayList<>();
+      for (FunctionCallExpr agg : aggExprs) {
+        boolean contains = false;
+        for (SelectListItem selectListItem : stmt.getSelectList().getItems()) {
+          contains = selectListItem.getExpr().equals(agg);
+          if (contains) {
+            break;
+          }
+        }
+        if (!contains) {
+          innerStmt.selectList_.getItems().add(
+              new SelectListItem(agg.clone().reset(), null));
+        }
+      }
+
+      // Remove clauses that will go into the outer statement.
+      innerStmt.havingClause_ = null;
+      innerStmt.limitElement_ = new LimitElement(null, null);
+      if (innerStmt.hasOrderByClause()) {
+        innerStmt.orderByElements_ = null;
+      }
+      innerStmt.reset();
+
+      // Used in the substitution map, as post analyze() exprs won't match.
+      final List<SelectListItem> preAnalyzeSelectList =
+          innerStmt.getSelectList().clone().getItems();
+      final ExprSubstitutionMap smap = new ExprSubstitutionMap();
+      List<String> colLabels =
+          Lists.newArrayListWithCapacity(innerStmt.getSelectList().getItems().size());
+
+      for (int i = 0; i < innerStmt.getSelectList().getItems().size(); ++i) {
+        String colAlias = stmt.getColumnAliasGenerator().getNextAlias();
+        colLabels.add(colAlias);
+      }
+
+      final String innerAlias = stmt.getTableAliasGenerator().getNextAlias();
+      final InlineViewRef innerView = new InlineViewRef(innerAlias, innerStmt, colLabels);
+      innerView.analyze(analyzer);
+
+      // Rewrite the new inline view.
+      rewriteSelectStatement(
+          (SelectStmt) innerView.getViewStmt(), innerView.getViewStmt().getAnalyzer());
+
+      for (int i = 0; i < preAnalyzeSelectList.size(); ++i) {
+        final Expr slot = new SlotRef(Lists.newArrayList(innerAlias, colLabels.get(i)));
+        slot.analyze(analyzer);
+        smap.put(preAnalyzeSelectList.get(i).getExpr(), slot);
+      }
+
+      // Create the new outer statement's select list.
+      final List<SelectListItem> outerSelectList = new ArrayList<>();
+      for (int i = 0; i < stmt.getSelectList().getItems().size(); ++i) {
+        // Project the original select list items and labels
+        final SelectListItem si = new SelectListItem(
+            stmt.getSelectList().getItems().get(i).getExpr().clone().reset().substitute(
+                smap, analyzer, false),
+            stmt.getColLabels().get(i));
+        si.getExpr().analyze(analyzer);
+        outerSelectList.add(si);
+      }
+
+      // Clear out the old stmt properties.
+      stmt.whereClause_ = stmt.havingClause_.reset().substitute(smap, analyzer, false);
+      stmt.whereClause_.analyze(analyzer);
+      stmt.havingClause_ = null;
+      stmt.groupingExprs_ = null;
+      stmt.selectList_.getItems().clear();
+      stmt.selectList_.getItems().addAll(outerSelectList);
+      stmt.fromClause_.getTableRefs().clear();
+      stmt.fromClause_.add(innerView);
+
+      stmt.analyze(analyzer);
+      if (LOG.isTraceEnabled())
+        LOG.trace("Rewritten HAVING Clause SQL: " + stmt.toSql(REWRITTEN));
     }
   }
 }

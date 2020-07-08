@@ -73,6 +73,9 @@ class TestTpcdsQuery(ImpalaTestSuite):
   def test_tpcds_q8(self, vector):
     self.run_test_case(self.get_workload() + '-q8', vector)
 
+  def test_tpcds_q9(self, vector):
+    self.run_test_case(self.get_workload() + '-q9', vector)
+
   def test_tpcds_q10a(self, vector):
     self.run_test_case(self.get_workload() + '-q10a', vector)
 
@@ -105,6 +108,18 @@ class TestTpcdsQuery(ImpalaTestSuite):
 
   def test_tpcds_q21(self, vector):
     self.run_test_case(self.get_workload() + '-q21', vector)
+
+  def test_tpcds_q23_1(self, vector):
+    self.run_test_case(self.get_workload() + '-q23-1', vector)
+
+  def test_tpcds_q23_2(self, vector):
+    self.run_test_case(self.get_workload() + '-q23-2', vector)
+
+  def test_tpcds_q24_1(self, vector):
+    self.run_test_case(self.get_workload() + '-q24-1', vector)
+
+  def test_tpcds_q24_2(self, vector):
+    self.run_test_case(self.get_workload() + '-q24-2', vector)
 
   def test_tpcds_q25(self, vector):
     self.run_test_case(self.get_workload() + '-q25', vector)
@@ -147,6 +162,9 @@ class TestTpcdsQuery(ImpalaTestSuite):
 
   def test_tpcds_q43(self, vector):
     self.run_test_case(self.get_workload() + '-q43', vector)
+
+  def test_tpcds_q44(self, vector):
+    self.run_test_case(self.get_workload() + '-q44', vector)
 
   def test_tpcds_q46(self, vector):
     self.run_test_case(self.get_workload() + '-q46', vector)
@@ -342,6 +360,9 @@ class TestTpcdsDecimalV2Query(ImpalaTestSuite):
   def test_tpcds_q8(self, vector):
     self.run_test_case(self.get_workload() + '-decimal_v2-q8', vector)
 
+  def test_tpcds_q9(self, vector):
+    self.run_test_case(self.get_workload() + '-decimal_v2-q9', vector)
+
   def test_tpcds_q10a(self, vector):
     self.run_test_case(self.get_workload() + '-decimal_v2-q10a', vector)
 
@@ -404,6 +425,9 @@ class TestTpcdsDecimalV2Query(ImpalaTestSuite):
 
   def test_tpcds_q37(self, vector):
     self.run_test_case(self.get_workload() + '-decimal_v2-q37', vector)
+
+  def test_tpcds_q38(self, vector):
+    self.run_test_case(self.get_workload() + '-decimal_v2-q38-rewrite', vector)
 
   def test_tpcds_q39_1(self, vector):
     self.run_test_case(self.get_workload() + '-decimal_v2-q39-1', vector)

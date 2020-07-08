@@ -1207,6 +1207,20 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
         "(select id from functional.alltypes t2 where t1.int_col = t2.int_col)",
         "Unsupported correlated subquery with runtime scalar check: " +
         "SELECT id FROM functional.alltypes t2 WHERE t1.int_col = t2.int_col");
+
+    // Scalar subqueries in the select list
+    AnalyzesOk("select id, 10 + (select max(int_col) from functional.alltypestiny) "
+        + "from functional.alltypestiny");
+    AnalyzesOk("select id, (select count(*) from functional.alltypestiny where int_col "
+        + "< (select max(int_col) from functional.alltypes)) from functional.dimtbl");
+    AnalysisError("select id, (select id, count(*) from functional.alltypestiny "
+            + "group by 1) from functional.dimtbl",
+        "A non-scalar subquery is not supported in the expression: "
+            + "(SELECT id, count(*) FROM functional.alltypestiny GROUP BY id)");
+    AnalysisError("select id, (select count(*) from functional.alltypestiny b where "
+            + "id=a.id ) from functional.alltypes a",
+        "A correlated scalar subquery is not supported in the expression: "
+            + "(SELECT count(*) FROM functional.alltypestiny b WHERE id = a.id)");
   }
 
   @Test
@@ -1339,19 +1353,24 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
   }
 
   @Test
-  public void TestIllegalSubquery() throws AnalysisException {
+  public void testIllegalSubquery() throws AnalysisException {
     // Predicate with a child subquery in the HAVING clause
-    AnalysisError("select id, count(*) from functional.alltypestiny t group by " +
-        "id having count(*) > (select count(*) from functional.alltypesagg)",
-        "Subqueries are not supported in the HAVING clause.");
-    AnalysisError("select id, count(*) from functional.alltypestiny t group by " +
-        "id having (select count(*) from functional.alltypesagg) > 10",
-        "Subqueries are not supported in the HAVING clause.");
+    AnalysisError("select id, count(*) from functional.alltypestiny t group by id " +
+        "having count(*) > (select count(*) from functional.alltypesagg where id = t.id)",
+        "Unsupported correlated subquery: SELECT count(*) FROM functional.alltypesagg " +
+        "WHERE id = t.id");
+    AnalysisError("select id, count(*) from functional.alltypestiny t group by id "
+            + "having (select count(*) from functional.alltypesagg) > 10 and count(*) < "
+            + "(select count(*) from functional.alltypesagg)",
+        "Multiple subqueries are not supported in expression: (SELECT count(*) FROM "
+            + "functional.alltypesagg) > 10 AND count(*) < (SELECT count(*) FROM "
+            + "functional.alltypesagg");
 
     // Subquery in the select list
-    AnalysisError("select id, (select int_col from functional.alltypestiny) " +
-        "from functional.alltypestiny",
-        "Subqueries are not supported in the select list.");
+    AnalysisError("select id, (select int_col from functional.alltypestiny) "
+            + "from functional.alltypestiny",
+        "A subquery which may return more than one row is not supported in the " +
+        "expression: " + "(SELECT int_col FROM functional.alltypestiny)");
 
     // Subquery in the GROUP BY clause
     AnalysisError("select id, count(*) from functional.alltypestiny " +
@@ -1482,5 +1501,14 @@ public class AnalyzeSubqueriesTest extends AnalyzerTest {
         "where (select int_col from functional.alltypes) is not null");
     AnalyzesOk("select 1 from functional.alltypes where " +
         "coalesce(null, (select bool_col from functional.alltypes where id = 0))");
+  }
+
+  @Test
+  public void testHavingSubqueries() throws AnalysisException {
+    // Predicate with a child subquery in the HAVING clause
+    AnalyzesOk("select id, count(*) from functional.alltypestiny t group by "
+        + "id having count(*) > (select count(*) from functional.alltypesagg)");
+    AnalyzesOk("select id, count(*) from functional.alltypestiny t group by "
+        + "id having (select count(*) from functional.alltypesagg) > 10");
   }
 }

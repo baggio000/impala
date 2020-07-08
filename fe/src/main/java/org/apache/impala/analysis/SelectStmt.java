@@ -32,6 +32,7 @@ import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ColumnAliasGenerator;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.common.TableAliasGenerator;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.rewrite.ExprRewriter;
@@ -90,7 +91,17 @@ public class SelectStmt extends QueryStmt {
   protected final List<String> colLabels_; // lower case column labels
   protected final FromClause fromClause_;
   protected Expr whereClause_;
+
+  // Grouping expressions for this select block, including expressions from the original
+  // query statement and additional expressions that may be added during rewriting.
   protected List<Expr> groupingExprs_;
+
+  // The original GROUP BY clause with information about grouping sets, etc.
+  // If there was no original GROUP BY clause, but grouping exprs are added during
+  // rewriting, this is initialized as a placeholder empty group by list.
+  // Non-null iff groupingExprs_ is non-null.
+  private GroupByClause groupByClause_;
+
   protected Expr havingClause_;  // original having clause
 
   // havingClause with aliases and agg output resolved
@@ -115,7 +126,7 @@ public class SelectStmt extends QueryStmt {
 
   SelectStmt(SelectList selectList,
              FromClause fromClause,
-             Expr wherePredicate, List<Expr> groupingExprs,
+             Expr wherePredicate, GroupByClause groupByClause,
              Expr havingPredicate, List<OrderByElement> orderByElements,
              LimitElement limitElement) {
     super(orderByElements, limitElement);
@@ -126,7 +137,12 @@ public class SelectStmt extends QueryStmt {
       fromClause_ = fromClause;
     }
     whereClause_ = wherePredicate;
-    groupingExprs_ = groupingExprs;
+    groupByClause_ = groupByClause;
+    if (groupByClause != null) {
+      groupingExprs_ = Expr.cloneList(groupByClause.getOrigGroupingExprs());
+    } else {
+      groupingExprs_ = null;
+    }
     havingClause_ = havingPredicate;
     colLabels_ = new ArrayList<>();
     havingPred_ = null;
@@ -158,6 +174,18 @@ public class SelectStmt extends QueryStmt {
   public boolean hasAnalyticInfo() { return analyticInfo_ != null; }
   public boolean hasHavingClause() { return havingClause_ != null; }
   public ExprSubstitutionMap getBaseTblSmap() { return baseTblSmap_; }
+
+  /**
+   * Append additional grouping expressions to the select list. Used by StmtRewriter.
+   */
+  protected void addGroupingExprs(List<Expr> addtlGroupingExprs) {
+    if (groupingExprs_ == null) {
+      groupByClause_ = new GroupByClause(
+          Collections.emptyList(), GroupByClause.GroupingSetsType.NONE);
+      groupingExprs_ = new ArrayList<>();
+    }
+    groupingExprs_.addAll(addtlGroupingExprs);
+  }
 
   // Column alias generator used during query rewriting.
   private ColumnAliasGenerator columnAliasGenerator_ = null;
@@ -274,9 +302,23 @@ public class SelectStmt extends QueryStmt {
           // Analyze the resultExpr before generating a label to ensure enforcement
           // of expr child and depth limits (toColumn() label may call toSql()).
           item.getExpr().analyze(analyzer_);
-          if (item.getExpr().contains(Predicates.instanceOf(Subquery.class))) {
-            throw new AnalysisException(
-                "Subqueries are not supported in the select list.");
+          // Check for scalar subquery types which are not supported
+          List<Subquery> subqueryExprs = new ArrayList<>();
+          item.getExpr().collect(Subquery.class, subqueryExprs);
+          for (Subquery s : subqueryExprs) {
+            Preconditions.checkState(s.getStatement() instanceof SelectStmt);
+            if (!s.returnsScalarColumn()) {
+              throw new AnalysisException("A non-scalar subquery is not supported in "
+                  + "the expression: " + item.getExpr().toSql());
+            }
+            if (s.getStatement().isRuntimeScalar()) {
+              throw new AnalysisException(
+                  "A subquery which may return more than one row is not supported in "
+                  + "the expression: " + item.getExpr().toSql());
+            }
+            Preconditions.checkState(((SelectStmt) s.getStatement()).returnsSingleRow(),
+                "Invariant violated: Only subqueries that are guaranteed to return a "
+                    + "single row are supported: " + item.getExpr().toSql());
           }
           resultExprs_.add(item.getExpr());
           String label = item.toColumnLabel(i, analyzer_.useHiveColLabels());
@@ -607,10 +649,12 @@ public class SelectStmt extends QueryStmt {
       // Analyze the HAVING clause first so we can check if it contains aggregates.
       // We need to analyze/register it even if we are not computing aggregates.
       if (havingClause_ == null) return;
-      // can't contain subqueries
-      if (havingClause_.contains(Predicates.instanceOf(Subquery.class))) {
+      List<Expr> subqueries = new ArrayList<>();
+      havingClause_.collectAll(Predicates.instanceOf(Subquery.class), subqueries);
+      if (subqueries.size() > 1) {
         throw new AnalysisException(
-            "Subqueries are not supported in the HAVING clause.");
+            "Multiple subqueries are not supported in expression: "
+            + havingClause_.toSql());
       }
       // Resolve (top-level) aliases and analyzes
       havingPred_ = resolveReferenceExpr(havingClause_, "HAVING", analyzer_,
@@ -708,6 +752,14 @@ public class SelectStmt extends QueryStmt {
       }
       // initialize groupingExprs_ with the analyzed version
       groupingExprs_ = groupingExprsCopy_;
+
+      if (groupByClause_ != null && groupByClause_.hasGroupingSets()) {
+        if (RuntimeEnv.INSTANCE.isGroupingSetsValidationEnabled()) {
+          throw new AnalysisException(groupByClause_.getTypeString() +
+              " not supported in GROUP BY");
+        }
+        groupByClause_.analyzeGroupingSets(groupingExprsCopy_);
+      }
     }
 
     private void collectAggExprs() {
@@ -783,6 +835,7 @@ public class SelectStmt extends QueryStmt {
       }
       Expr.removeDuplicates(aggExprs_);
       Expr.removeDuplicates(groupingExprs);
+      // TODO: IMPALA-9898: need to pass in grouping set info for MultiAggregateInfo.
       multiAggInfo_ = new MultiAggregateInfo(groupingExprs, aggExprs_);
       multiAggInfo_.analyze(analyzer_);
     }
@@ -804,10 +857,6 @@ public class SelectStmt extends QueryStmt {
         LOG.trace("post-agg selectListExprs: " + Expr.debugString(resultExprs_));
       }
       if (havingPred_ != null) {
-        // Make sure the predicate in the HAVING clause does not contain a
-        // subquery.
-        Preconditions.checkState(!havingPred_.contains(
-            Predicates.instanceOf(Subquery.class)));
         havingPred_ = havingPred_.substitute(combinedSmap, analyzer_, false);
         analyzer_.registerConjuncts(havingPred_, true);
         if (LOG.isTraceEnabled()) {
@@ -1055,16 +1104,16 @@ public class SelectStmt extends QueryStmt {
     Preconditions.checkState(isAnalyzed());
     selectList_.rewriteExprs(rewriter, analyzer_);
     for (TableRef ref: fromClause_.getTableRefs()) ref.rewriteExprs(rewriter, analyzer_);
+    List<Subquery> subqueryExprs = new ArrayList<>();
     if (whereClause_ != null) {
       whereClause_ = rewriter.rewrite(whereClause_, analyzer_);
-      // Also rewrite exprs in the statements of subqueries.
-      List<Subquery> subqueryExprs = new ArrayList<>();
       whereClause_.collect(Subquery.class, subqueryExprs);
-      for (Subquery s: subqueryExprs) s.getStatement().rewriteExprs(rewriter);
     }
     if (havingClause_ != null) {
       havingClause_ = rewriteCheckOrdinalResult(rewriter, havingClause_);
+      havingClause_.collect(Subquery.class, subqueryExprs);
     }
+    for (Subquery s : subqueryExprs) s.getStatement().rewriteExprs(rewriter);
     if (groupingExprs_ != null) {
       for (int i = 0; i < groupingExprs_.size(); ++i) {
         groupingExprs_.set(i, rewriteCheckOrdinalResult(
@@ -1112,17 +1161,13 @@ public class SelectStmt extends QueryStmt {
       strBuilder.append(whereClause_.toSql(options));
     }
     // Group By clause
-    if (groupingExprs_ != null) {
-      strBuilder.append(" GROUP BY ");
+    if (groupByClause_ != null) {
       // Handle both analyzed (multiAggInfo_ != null) and unanalyzed cases.
       // Unanalyzed case us used to generate SQL such as for views.
       // See ToSqlUtils.getCreateViewSql().
       List<Expr> groupingExprs = multiAggInfo_ == null
           ? groupingExprs_ : multiAggInfo_.getGroupingExprs();
-      for (int i = 0; i < groupingExprs.size(); ++i) {
-        strBuilder.append(groupingExprs.get(i).toSql(options));
-        strBuilder.append((i+1 != groupingExprs.size()) ? ", " : "");
-      }
+      strBuilder.append(groupByClause_.toSql(groupingExprs, options));
     }
     // Having clause
     if (havingClause_ != null) {
@@ -1183,6 +1228,8 @@ public class SelectStmt extends QueryStmt {
     whereClause_ = (other.whereClause_ != null) ? other.whereClause_.clone() : null;
     groupingExprs_ =
         (other.groupingExprs_ != null) ? Expr.cloneList(other.groupingExprs_) : null;
+    groupByClause_ =
+        (other.groupByClause_ != null) ? other.groupByClause_.clone() : null;
     havingClause_ = (other.havingClause_ != null) ? other.havingClause_.clone() : null;
     colLabels_ = Lists.newArrayList(other.colLabels_);
     multiAggInfo_ = (other.multiAggInfo_ != null) ? other.multiAggInfo_.clone() : null;
@@ -1197,12 +1244,20 @@ public class SelectStmt extends QueryStmt {
     if (fromClauseOnly) {
       fromClause_.collectFromClauseTableRefs(tblRefs);
     } else {
+      // Collect TableRefs in all subqueries.
       fromClause_.collectTableRefs(tblRefs);
-    }
-    if (!fromClauseOnly && whereClause_ != null) {
-      // Collect TableRefs in WHERE-clause subqueries.
       List<Subquery> subqueries = new ArrayList<>();
-      whereClause_.collect(Subquery.class, subqueries);
+      if (whereClause_ != null) {
+        whereClause_.collect(Subquery.class, subqueries);
+      }
+      if (havingClause_ != null) {
+        havingClause_.collect(Subquery.class, subqueries);
+      }
+      for (SelectListItem item : selectList_.getItems()) {
+        if (item.isStar()) continue;
+        item.getExpr().collect(Subquery.class, subqueries);
+      }
+
       for (Subquery sq: subqueries) {
         sq.getStatement().collectTableRefs(tblRefs, fromClauseOnly);
       }
@@ -1211,8 +1266,6 @@ public class SelectStmt extends QueryStmt {
 
   @Override
   public void collectInlineViews(Set<FeView> inlineViews) {
-    // Impala currently supports sub queries only in FROM, WHERE & WITH clauses. Hence,
-    // this function does not carry out any checks on HAVING clause.
     super.collectInlineViews(inlineViews);
     List<TableRef> fromTblRefs = getTableRefs();
     Preconditions.checkNotNull(inlineViews);
@@ -1236,6 +1289,17 @@ public class SelectStmt extends QueryStmt {
         whereSubQueries.get(0).getStatement().collectInlineViews(inlineViews);
       }
     }
+    List<Subquery> subqueries = Lists.newArrayList();
+    for (SelectListItem item : selectList_.getItems()) {
+      if (item.isStar()) continue;
+      item.getExpr().collect(Subquery.class, subqueries);
+    }
+    if (havingClause_ != null) {
+      havingClause_.collect(Subquery.class, subqueries);
+    }
+    for (Subquery sq : subqueries) {
+      sq.getStatement().collectInlineViews(inlineViews);
+    }
   }
 
   @Override
@@ -1245,6 +1309,7 @@ public class SelectStmt extends QueryStmt {
     colLabels_.clear();
     fromClause_.reset();
     if (whereClause_ != null) whereClause_.reset();
+    if (groupByClause_ != null) groupByClause_.reset();
     if (groupingExprs_ != null) Expr.resetList(groupingExprs_);
     if (havingClause_ != null) havingClause_.reset();
     havingPred_ = null;
@@ -1266,6 +1331,9 @@ public class SelectStmt extends QueryStmt {
    *
    * This function may produce false negatives because the cardinality of the
    * result set also depends on the data a stmt is processing.
+   *
+   * TODO: IMPALA-1285 to cover more cases that can be determinded at plan time such has a
+   * group by clause where all grouping expressions are bound to constant expressions.
    */
   public boolean returnsSingleRow() {
     Preconditions.checkState(isAnalyzed());
@@ -1277,6 +1345,7 @@ public class SelectStmt extends QueryStmt {
     if (hasMultiAggInfo() && !hasGroupByClause() && !selectList_.isDistinct()) {
       return true;
     }
+
     // Select from an inline view that returns at most one row.
     List<TableRef> tableRefs = fromClause_.getTableRefs();
     if (tableRefs.size() == 1 && tableRefs.get(0) instanceof InlineViewRef) {
