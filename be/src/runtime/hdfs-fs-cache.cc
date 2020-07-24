@@ -68,6 +68,7 @@ Status HdfsFsCache::Init() {
   return Status::OK();
 }
 
+// TODO: yidawu use get connection to impl
 Status HdfsFsCache::GetConnection(const string& path, hdfsFS* fs,
     HdfsFsMap* local_cache) {
   string err;

@@ -37,8 +37,8 @@
 #include "util/thread.h"
 
 namespace impala {
-class TmpFileRemote;
 namespace io {
+
 class DataCache;
 class DiskQueue;
 
@@ -306,6 +306,14 @@ class DiskIoMgr : public CacheLineAligned {
   /// The disk ID (and therefore disk_queues_ index) used for Ozone accesses.
   int RemoteOzoneDiskId() const { return num_local_disks() + REMOTE_OZONE_DISK_OFFSET; }
 
+  int RemoteFileUploadDiskId() const {
+    return num_local_disks() + REMOTE_FILE_UPLOAD_OFFSET;
+  }
+
+  int RemoteFileFetchDiskId() const {
+    return num_local_disks() + REMOTE_FILE_FETCH_OFFSET;
+  }
+
   /// Dumps the disk IoMgr queues (for readers and disks)
   std::string DebugString();
 
@@ -357,6 +365,8 @@ class DiskIoMgr : public CacheLineAligned {
     REMOTE_ADLS_DISK_OFFSET,
     REMOTE_ABFS_DISK_OFFSET,
     REMOTE_OZONE_DISK_OFFSET,
+    REMOTE_FILE_UPLOAD_OFFSET,
+    REMOTE_FILE_FETCH_OFFSET,
     REMOTE_NUM_DISKS
   };
 
@@ -387,10 +397,11 @@ class DiskIoMgr : public CacheLineAligned {
   friend class DiskQueue;
   friend class ScanRange;
   friend class WriteRange;
+  friend class RemoteOperRange;
   friend class HdfsFileReader;
-  friend class impala::TmpFileRemote;
   friend class HdfsFileWriter;
   friend class LocalFileWriter;
+  friend class TmpFile;
 
   struct hadoopRzOptions* cached_read_options() { return cached_read_options_; }
 

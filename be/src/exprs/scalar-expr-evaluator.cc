@@ -21,6 +21,7 @@
 
 #include "common/object-pool.h"
 #include "common/status.h"
+#include "datasketches-functions.h"
 #include "exprs/aggregate-functions.h"
 #include "exprs/anyval-util.h"
 #include "exprs/bit-byte-functions.h"
@@ -28,7 +29,6 @@
 #include "exprs/cast-functions.h"
 #include "exprs/compound-predicates.h"
 #include "exprs/conditional-functions.h"
-#include "datasketches-functions.h"
 #include "exprs/date-functions.h"
 #include "exprs/decimal-functions.h"
 #include "exprs/decimal-operators.h"

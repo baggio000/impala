@@ -18,13 +18,17 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <memory>
+#include <unordered_map>
 #include <utility>
+#include <bits/stdc++.h>
 
 #include <mutex>
 #include <boost/scoped_ptr.hpp>
 #include <gtest/gtest_prod.h>
 
+#include "common/atomic.h"
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "gen-cpp/CatalogObjects_types.h" // for THdfsCompression
@@ -43,6 +47,8 @@ namespace io {
   class RequestContext;
   class ScanRange;
   class WriteRange;
+  class RemoteOperRange;
+  class HdfsFileWriter;
 }
 struct BufferPoolClientCounters;
 class MemTracker;
@@ -99,10 +105,11 @@ class TmpFileMgr {
 
   /// A configured temporary directory that TmpFileMgr allocates files in.
   struct TmpDir {
-    TmpDir(const std::string& path, int64_t bytes_limit, IntGauge* bytes_used_metric,
-        bool expected_local = true)
+    TmpDir(const std::string& path, int64_t bytes_limit, int priority,
+        IntGauge* bytes_used_metric, bool expected_local = true)
       : path(path),
         bytes_limit(bytes_limit),
+        priority(priority),
         bytes_used_metric(bytes_used_metric),
         expected_local(expected_local) {}
 
@@ -112,6 +119,9 @@ class TmpFileMgr {
     /// Limit on bytes that should be written to this path. Set to maximum value
     /// of int64_t if there is no limit.
     int64_t const bytes_limit;
+
+    /// Scratch directory priority.
+    const int priority;
 
     /// The current bytes of scratch used for this temporary directory.
     IntGauge* const bytes_used_metric;
@@ -143,6 +153,12 @@ class TmpFileMgr {
   /// Return the scratch directory path for the device.
   std::string GetTmpDirPath(DeviceId device_id) const;
 
+  /// Return the remote temporary file size
+  int64_t GetRemoteTmpFileSize() const;
+
+  /// Return the remote temporary block size
+  int64_t GetRemoteTmpBlockSize() const;
+
   /// Total number of devices with tmp directories that are active. There is one tmp
   /// directory per device.
   int NumActiveTmpDevices();
@@ -173,6 +189,8 @@ class TmpFileMgr {
   friend class TmpFileMgrTest;
   friend class TmpFile;
   friend class TmpFileGroup;
+  friend class io::ScanRange;
+  friend class io::RemoteOperRange;
 
   /// Return a new TmpFile handle with a path based on file_group->unique_id. The file is
   /// associated with the 'file_group' and the file path is within the (single) scratch
@@ -197,6 +215,19 @@ class TmpFileMgr {
 
   /// The paths of the created tmp directories.
   std::vector<TmpDir> tmp_dirs_;
+
+  std::vector<TmpDir> tmp_dirs_remote_;
+
+  std::unique_ptr<TmpDir> local_buff_dir_;
+
+  int64_t remote_tmp_file_size_;
+
+  int64_t remote_tmp_block_size_;
+
+  // TODO: yidawu del it, for test
+  bool remote_tmp_file_local_buff_mode_;
+
+  bool remote_tmp_files_avail_pool_lifo_;
 
   /// Memory tracker to track compressed buffers. Set up in InitCustom() if disk spill
   /// compression is enabled
@@ -282,6 +313,18 @@ class TmpFileGroup {
   /// Calls Remove() on all the files in the group and deletes them.
   void Close();
 
+  template <typename T>
+  void CloseInternal(vector<T>& tmp_files);
+
+  void EnqueTmpFilesPool(TmpFile* tmp_file, bool front = true);
+
+  void DequeTmpFilesPool(TmpFile** tmp_file);
+
+  /// Only for evict local buffer files.
+  Status EvictFile(TmpFile* tmp_file, bool change_metrics = true);
+
+  std::string GenerateNewPath(string& dir, string& unique_name);
+
   std::string DebugString();
 
   const TUniqueId& unique_id() const { return unique_id_; }
@@ -290,8 +333,12 @@ class TmpFileGroup {
 
  private:
   friend class TmpFile;
+  friend class TmpFileLocal;
+  friend class TmpFileRemote;
   friend class TmpFileMgrTest;
   friend class TmpWriteHandle;
+  friend class io::ScanRange;
+  friend class io::RemoteOperRange;
 
   /// Initializes the file group with one temporary file per disk with a scratch
   /// directory. Returns OK if at least one temporary file could be created.
@@ -305,8 +352,11 @@ class TmpFileGroup {
   Status AllocateSpace(
       int64_t num_bytes, TmpFile** tmp_file, int64_t* file_offset) WARN_UNUSED_RESULT;
 
-  Status AllocateSpace(
-      const MemRange& page, TmpFile** tmp_file, int64_t* file_offset) WARN_UNUSED_RESULT;
+  /// Must be called without 'lock_' held.
+  Status EvictFile(TmpFileMgr::DeviceId* device_id) WARN_UNUSED_RESULT;
+
+  /// Must be called without 'lock_' held.
+  Status AssignFreeDevice(TmpFileMgr::DeviceId* device_id) WARN_UNUSED_RESULT;
 
   /// Recycle the range of bytes in a scratch file and destroy 'handle'. Called when the
   /// range is no longer in use for 'handle'. The disk space associated with the file can
@@ -388,19 +438,53 @@ class TmpFileGroup {
   /// Protects below members.
   SpinLock lock_;
 
-  /// List of files representing the TmpFileGroup.
+  /// List of files representing the TmpFileGroup. Files are ordered by the priority of
+  /// the related TmpDir.
   std::vector<std::unique_ptr<TmpFile>> tmp_files_;
 
-  /// The file representing the TmpFileGroup.
-  TmpFileRemote* tmp_file_remote_ = nullptr;
+  /// List of remote files representing the TmpFileGroup.
+  std::vector<std::unique_ptr<TmpFile>> tmp_files_remote_;
+
+  //  std::stack<TmpFile*> tmp_files_avail_pool_;
+
+  /*
+    class TmpFilePtr : public boost::intrusive::list_base_hook<> {
+    public:
+      TmpFilePtr(TmpFile* tmp_file): ptr_(tmp_file){}
+        TmpFile* tmp_file() {return ptr_;}
+    private:
+      TmpFile* ptr_;
+    };*/
+
+  std::list<TmpFile*> tmp_files_avail_pool_;
+
+  AtomicInt64 tmp_files_pool_cnt_{0};
+
+  ConditionVariable uploaded_pool_available_;
+
+  /// Protects uploaded pool members.
+  std::mutex tmp_files_uploaded_pool_lock_;
+
+  /// Index Range in the 'tmp_files'. Used to keep track of index range
+  /// corresponding to a given priority.
+  struct TmpFileIndexRange {
+    TmpFileIndexRange(int start, int end) : start(start), end(end) {}
+    // Start index of the range.
+    const int start;
+    // End index of the range.
+    const int end;
+  };
+  /// Map storing the index range in the 'tmp_files', corresponding to scratch dirs's
+  /// priority.
+  std::map<int, TmpFileIndexRange> tmp_files_index_range_;
 
   /// Total space allocated in this group's files.
   int64_t current_bytes_allocated_;
 
   /// Index into 'tmp_files' denoting the file to which the next temporary file range
-  /// should be allocated from. Used to implement round-robin allocation from temporary
-  /// files.
-  int next_allocation_index_;
+  /// should be allocated from, for a given priority. Used to implement round-robin
+  /// allocation from temporary files.
+  std::unordered_map<int, int> next_allocation_index_;
 
   /// Each vector in free_ranges_[i] is a vector of File/offset pairs for free scratch
   /// ranges of length 2^i bytes. Has 64 entries so that every int64_t length has a

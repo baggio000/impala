@@ -26,19 +26,25 @@ namespace io {
 /// File writer class for HDFS.
 class HdfsFileWriter : public FileWriter {
  public:
-  HdfsFileWriter(hdfsFS hdfs_conn, bool expected_local)
-    : FileWriter(), hdfs_conn_(hdfs_conn), expected_local_(expected_local) {}
+  HdfsFileWriter(DiskIoMgr* io_mgr, TmpFile* tmp_file, hdfsFS hdfs_conn,
+      int64_t file_size, bool expected_local)
+    : FileWriter(io_mgr, tmp_file, file_size),
+      hdfs_conn_(hdfs_conn),
+      expected_local_(expected_local),
+      block_size_(io_mgr->GetRemoteTmpBlockSize()) {}
 
   ~HdfsFileWriter();
 
   virtual Status Open() override;
-  virtual Status Write() override;
+  virtual Status Write(WriteRange* range = nullptr, bool* is_ready = nullptr) override;
   virtual Status Close() override;
 
  private:
   hdfsFS const hdfs_conn_;
 
-  hdfsFile hdfs_file_;
+  hdfsFile hdfs_file_ = nullptr;
+
+  const int64_t block_size_;
 
   /// The hdfs file handle is stored here in three cases:
   /// 1. The file handle cache is off (max_cached_file_handles == 0).
@@ -63,7 +69,7 @@ class HdfsFileWriter : public FileWriter {
   /// log the number of unexpected remote bytes for a scan range. To solve both
   /// requirements, maintain num_remote_bytes_ on the ScanRange and push it to the
   /// reader_ once at the close of the scan range.
-  int64_t num_remote_bytes_ = 0;
+  // int64_t num_remote_bytes_ = 0;
 };
 }
 }

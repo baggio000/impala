@@ -139,6 +139,10 @@ class RequestContext {
   /// on the IoMgr disk queue.
   Status AddWriteRange(WriteRange* write_range) WARN_UNUSED_RESULT;
 
+  /// Add a RemoteOperRange for the writer. This is non-blocking and schedules the context
+  /// on the IoMgr disk queue.
+  Status AddRemoteOperRange(RemoteOperRange* write_range) WARN_UNUSED_RESULT;
+
   /// Cancel the context asynchronously. All outstanding requests are cancelled
   /// asynchronously. This does not need to be called if the context finishes normally.
   /// Calling GetNext() on any scan ranges belonging to this RequestContext will return
@@ -224,7 +228,7 @@ class RequestContext {
   friend class ScanRange;
   friend class HdfsFileReader;
   friend class WriteRange;
-  friend class impala::TmpFileRemote;
+  friend class RemoteOperRange;
   friend class HdfsFileWriter;
   friend class LocalFileWriter;
 
@@ -288,6 +292,8 @@ class RequestContext {
   /// etc. is passed via write_status and to the callback. A write error does not cancel
   /// the writer context - that decision is left to the callback handler.
   void WriteDone(WriteRange* write_range, const Status& write_status);
+
+  void RemoteOperDone(RemoteOperRange* oper_range, const Status& write_status);
 
   /// Cancel the context if not already cancelled, wait for all scan ranges to finish
   /// and mark the context as inactive, after which it cannot be used.

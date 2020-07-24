@@ -23,13 +23,12 @@
 
 namespace impala {
 
-BigIntVal DataSketchesFunctions::DsHllEstimate(FunctionContext* ctx,
-    const StringVal& serialized_sketch) {
+BigIntVal DataSketchesFunctions::DsHllEstimate(
+    FunctionContext* ctx, const StringVal& serialized_sketch) {
   if (serialized_sketch.is_null || serialized_sketch.len == 0) return BigIntVal::null();
   try {
-    datasketches::hll_sketch sketch =
-        datasketches::hll_sketch::deserialize((void*)serialized_sketch.ptr,
-            serialized_sketch.len);
+    datasketches::hll_sketch sketch = datasketches::hll_sketch::deserialize(
+        (void*)serialized_sketch.ptr, serialized_sketch.len);
     return sketch.get_estimate();
   } catch (const std::invalid_argument&) {
     // Deserialization throws if the input string is not a serialized sketch.
@@ -37,6 +36,4 @@ BigIntVal DataSketchesFunctions::DsHllEstimate(FunctionContext* ctx,
     return BigIntVal::null();
   }
 }
-
 }
-

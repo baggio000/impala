@@ -20,12 +20,19 @@
 
 #include <string>
 
+#include <boost/thread/shared_mutex.hpp>
 #include "common/atomic.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/io/file-writer.h"
 #include "runtime/tmp-file-mgr.h"
 
 namespace impala {
+namespace io {
+class LocalFileWriter;
+}
+
+enum class LocalFileMode { BUFFER, FILE };
+
 /// TmpFile is a handle to a physical file in a temporary directory. File space
 /// can be allocated and files removed using AllocateSpace() and Remove(). Used
 /// internally by TmpFileMgr.
@@ -37,7 +44,9 @@ namespace impala {
 class TmpFile {
  public:
   TmpFile(TmpFileGroup* file_group, TmpFileMgr::DeviceId device_id,
-      const std::string& path, bool expected_local, const char* url = nullptr);
+      const std::string& path, bool expected_local, const char* url = nullptr,
+      const std::string* local_buffer_path = nullptr,
+      TmpFileMgr::DeviceId* local_device_id = nullptr);
 
   ~TmpFile();
 
@@ -47,7 +56,7 @@ class TmpFile {
   /// This function does not actually perform any file operations.
   /// On success, sets 'offset' to the file offset of the first byte in the allocated
   /// range on success.
-  bool AllocateSpace(int64_t num_bytes, int64_t* offset);
+  virtual bool AllocateSpace(int64_t num_bytes, int64_t* offset) = 0;
 
   /// Called when an IO error is encountered for this file. Logs the error and blacklists
   /// the file.
@@ -55,7 +64,10 @@ class TmpFile {
 
   /// Delete the physical file on disk, if one was created.
   /// It is not valid to read or write to a file after calling Remove().
-  Status Remove();
+  virtual Status Remove() = 0;
+
+  /// Caller should hold the lock.
+  virtual Status RemoveLocalBuff() = 0;
 
   /// Get the disk ID that should be used for IO mgr queueing.
   int AssignDiskQueue() const;
@@ -63,15 +75,37 @@ class TmpFile {
   /// Try to punch a hole in the file of size 'len' at 'offset'.
   Status PunchHole(int64_t offset, int64_t len);
 
-  void Reset(io::WriteRange* range);
+  void ResetLocalBuffPath(const string& path, TmpFileMgr::DeviceId device_id);
+  const string& LocalBuffPath() { return local_buffer_path_; }
 
+  // If the local file is in buffer mode, writer will wait for the whole file finished,
+  // and
+  // write once. If it is file mode, after each write range will close the file handle.
   void SetDumped(bool dumped = true) { dumped_ = dumped; }
+
+  void SetInDumping(bool is_dumping = true) { in_dumping_ = is_dumping; }
+
+  void SetInWriting(bool in_writing = true) { in_writing_ = in_writing; }
 
   void SetRemote(bool remote = true) { remote_ = remote; }
 
-  void SetInMemory(bool in_mem = true) { in_mem_ = in_mem; }
+  // Should call with lock;
+  void UpdateUnpinCnt() { unpinned_page_cnt_.Add(1); }
+  int64_t GetUnpinCnt() { return unpinned_page_cnt_.Load(); }
+
+  // Should call with lock;
+  void UpdatePinCnt() { pinned_page_cnt_.Add(1); }
+  int64_t GetPinCnt() { return pinned_page_cnt_.Load(); }
+
+  bool AllPinned();
+
+  virtual io::FileWriter* GetFileWriter(bool write_to_buff = false) = 0;
 
   const std::string& path() const { return path_; }
+
+  int64_t file_size() const { return file_size_; }
+
+  LocalFileMode mode() const { return mode_; }
 
   /// Caller must hold TmpFileMgr::FileGroup::lock_.
   bool is_blacklisted() const { return blacklisted_; }
@@ -80,20 +114,25 @@ class TmpFile {
 
   bool is_dumped() { return dumped_; }
 
+  bool is_dumping() { return in_dumping_; }
+
+  bool is_writing() { return in_writing_; }
+
   bool is_remote() { return remote_; }
 
-  bool is_in_memory() { return in_mem_; }
-
   int64_t const len() { return allocation_offset_; }
-
-  const uint8* buffer() const { return buffer_; }
 
   std::string DebugString();
 
  private:
+  friend class io::RemoteOperRange;
+  friend class io::ScanRange;
   friend class io::WriteRange;
+  friend class io::HdfsFileWriter;
+  friend class io::LocalFileWriter;
   friend class TmpFileGroup;
   friend class TmpFileRemote;
+  friend class TmpFileLocal;
   friend class TmpFileMgrTest;
 
   /// The name of the sub-directory that Impala creates within each configured scratch
@@ -131,58 +170,84 @@ class TmpFile {
   /// Protected by TmpFileMgr::FileGroup::lock_.
   bool blacklisted_;
 
-  // TODO: yidawu set below as status
-  /// Done_ will be set to true if the file is ready to be written
-  bool done_ = false;
+  /// done_ is set to true if all the space in the file has been assigned
+  volatile bool done_ = false;
 
-  bool dumped_ = false;
+  /// dumped is set to true if the file exists locally.
+  volatile bool dumped_ = false;
 
-  bool remote_ = false;
+  /// in_dumping_ is set to true if the file is dumping locally.
+  volatile bool in_dumping_ = false;
 
-  bool in_mem_ = false;
+  /// in_writing_ is set to true if the file is in writing, it is the initial status.
+  volatile bool in_writing_ = true;
 
-  io::WriteRange* write_range_ = nullptr;
+  /// remote_ is set to true if the file is uploaded to remote.
+  volatile bool remote_ = false;
 
   std::unique_ptr<io::FileWriter> file_writer_;
 
-  const uint8* buffer_;
+  std::unique_ptr<io::FileWriter> local_buffer_writer_;
+
+  std::mutex dump_lock_;
+  ConditionVariable dump_done_;
 
   hdfsFS hdfs_conn_;
 
-  string hdfs_url_;
+  int64_t file_size_ = 0;
+
+  AtomicInt64 unpinned_page_cnt_{0};
+
+  AtomicInt64 pinned_page_cnt_{0};
+
+  LocalFileMode mode_;
+
+  string local_buffer_path_;
+
+  TmpFileMgr::DeviceId local_buffer_device_id_;
+
+  int local_buffer_disk_id_;
+
+  // Every time to check/modify the status, or need to gurrantee working under
+  // certain status, the caller should own the lock
+  SpinLock status_lock_;
+
+  // Protect the physical file from renaming or deleting while using
+  boost::shared_mutex lock_;
 
   /// Helper to get the TmpDir that this file is associated with.
   TmpFileMgr::TmpDir* GetDir();
+  TmpFileMgr::TmpDir* GetLocalBuffDir();
+};
+
+class TmpFileLocal : public TmpFile {
+ public:
+  using TmpFile::TmpFile;
+
+  bool AllocateSpace(int64_t num_bytes, int64_t* offset);
+  io::FileWriter* GetFileWriter(bool write_to_buff = false);
+  Status Remove();
+  Status RemoveLocalBuff() { return Status::OK(); };
 };
 
 class TmpFileRemote : public TmpFile {
  public:
   using TmpFile::TmpFile;
-  // TODO: yidawu set it by a property
-  // default: 16M
-  const static int64_t buffer_size_ = 16 * 1024 * 1024;
-  // Protect the write buffer
-  SpinLock write_buffer_lock_;
-  string path_local_;
 
-  // TODO: ydiawu will be replaced by dynamic allocation from pool
-  uint8 write_buffer_[buffer_size_];
-  bool AllocateSpace(const MemRange& page, int64_t* offset);
-  SpinLock* BufferLock() { return &write_buffer_lock_; }
-  uint8* const WriteBuffer() { return write_buffer_; }
-  // TODO: yidawu should be set in the contruct function
-  void SetLocalPath(string path) { path_local_ = path; }
-  string LocalPath() { return path_local_; }
-  void FetchFromRemote();
+  bool AllocateSpace(int64_t num_bytes, int64_t* offset);
+  io::FileWriter* GetFileWriter(bool write_to_buff = false);
+  Status Remove();
+  Status RemoveLocalBuff();
+
+ private:
+  friend class io::RemoteOperRange;
+  friend class io::ScanRange;
+  friend class io::WriteRange;
+
+  std::unique_ptr<io::RemoteOperRange> upload_range_;
+
+  std::unique_ptr<io::RemoteOperRange> evict_range_;
 };
-
-/*
-class TmpFileRemoteConnections {
-  public:
-    void* GetConnection(string path);
-  private:
-    map<string, void*> connections_;
-}*/
 
 } // namespace impala
 

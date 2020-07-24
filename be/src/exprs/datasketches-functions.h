@@ -26,9 +26,7 @@ using impala_udf::FunctionContext;
 using impala_udf::StringVal;
 
 class DataSketchesFunctions {
-public:
+ public:
   static BigIntVal DsHllEstimate(FunctionContext*, const StringVal&);
 };
-
 }
-

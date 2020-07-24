@@ -23,11 +23,20 @@
 #include "runtime/tmp-file-mgr-internal.h"
 #include "util/error-util.h"
 #include "util/hdfs-util.h"
+// TODO: yidawu for unique name
+#include <boost/lexical_cast.hpp>
+#include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/uuid_io.hpp>
 
 #include "common/names.h"
 
 using namespace impala;
 using namespace impala::io;
+using namespace std;
+using std::mutex;
+using std::unique_lock;
+// TODO: yidawu for unique name
+using boost::uuids::random_generator;
 
 DECLARE_bool(cache_remote_file_handles);
 DECLARE_bool(cache_s3_file_handles);
@@ -160,7 +169,8 @@ unique_ptr<BufferDescriptor> ScanRange::GetUnusedBuffer(
   return result;
 }
 
-ReadOutcome ScanRange::DoRead(DiskQueue* queue, int disk_id) {
+ReadOutcome ScanRange::DoReadInternal(
+    DiskQueue* queue, int disk_id, FileReader* file_reader) {
   int64_t bytes_remaining = bytes_to_read_ - bytes_read_;
   DCHECK_GT(bytes_remaining, 0);
 
@@ -205,40 +215,7 @@ ReadOutcome ScanRange::DoRead(DiskQueue* queue, int disk_id) {
     use_file_handle_cache = true;
   }
 
-  // TODO: yidawu check why tmp_file_ is null in some case
-  /*  if (tmp_file_ != nullptr && (disk_id_ == io_mgr_->RemoteDfsDiskId() ||
-      disk_id_ == io_mgr_->RemoteS3DiskId()) ) {*/
-  if (tmp_file_ != nullptr) {
-    TmpFileRemote* tmp_file = (TmpFileRemote*)tmp_file_;
-    {
-      lock_guard<SpinLock> lock(*(tmp_file->BufferLock()));
-      // If it is in memory, read it from memory
-      if (tmp_file->is_in_memory()) {
-        // TODO: yidawu Reach data from buffer
-        // TODO: need to add metric
-        memcpy(buffer_desc->buffer_, tmp_file->WriteBuffer() + offset_, bytes_to_read_);
-        // TODO: not sure if it is eof if have read all
-        buffer_desc->eosr_ = true;
-        buffer_desc->len_ = bytes_to_read_;
-        if (!EnqueueReadyBuffer(move(buffer_desc))) return ReadOutcome::CANCELLED;
-        return ReadOutcome::SUCCESS_EOSR;
-      }
-    }
-    // If it is in remote, and the local buffer has been deleted
-    // fetch the file from remote
-    if (!tmp_file->is_dumped()) {
-      DCHECK(tmp_file->is_remote());
-
-      // evict an old file if the buffer in local disk is full
-
-      // get the file
-      // The connection belongs to the queue, only queue will call the function,
-      // so it is supposed the connection is only used by the current thread
-      tmp_file->FetchFromRemote();
-    }
-  }
-
-  Status read_status = file_reader_->Open(use_file_handle_cache);
+  Status read_status = file_reader->Open(use_file_handle_cache);
   bool eof = false;
 
   if (read_status.ok()) {
@@ -247,10 +224,10 @@ ReadOutcome ScanRange::DoRead(DiskQueue* queue, int disk_id) {
 
     if (sub_ranges_.empty()) {
       DCHECK(cache_.data == nullptr);
-      read_status = file_reader_->ReadFromPos(queue, offset_ + bytes_read_,
-          buffer_desc->buffer_,
-          min(bytes_to_read() - bytes_read_, buffer_desc->buffer_len_),
-          &buffer_desc->len_, &eof);
+      read_status =
+          file_reader->ReadFromPos(queue, offset_ + bytes_read_, buffer_desc->buffer_,
+              min(bytes_to_read() - bytes_read_, buffer_desc->buffer_len_),
+              &buffer_desc->len_, &eof);
     } else {
       read_status = ReadSubRanges(queue, buffer_desc.get(), &eof);
     }
@@ -260,8 +237,8 @@ ReadOutcome ScanRange::DoRead(DiskQueue* queue, int disk_id) {
   }
 
   DCHECK(buffer_desc->buffer_ != nullptr);
-  DCHECK(!buffer_desc->is_cached()) <<
-      "Pure HDFS cache reads don't go through this code path.";
+  DCHECK(!buffer_desc->is_cached())
+      << "Pure HDFS cache reads don't go through this code path.";
   if (!read_status.ok()) {
     // Free buffer to release resources before we cancel the range so that all buffers
     // are freed at cancellation.
@@ -289,12 +266,170 @@ ReadOutcome ScanRange::DoRead(DiskQueue* queue, int disk_id) {
   // Store the state we need before calling EnqueueReadyBuffer().
   bool eosr = buffer_desc->eosr();
   // No more reads for this scan range - we can close it.
-  if (eosr) file_reader_->Close();
+  if (eosr) file_reader->Close();
   // Read successful - enqueue the buffer and return the appropriate outcome.
   if (!EnqueueReadyBuffer(move(buffer_desc))) return ReadOutcome::CANCELLED;
   // At this point, if eosr=true, then we cannot touch the state of this scan range
   // because the client may notice eos, then reuse the scan range.
   return eosr ? ReadOutcome::SUCCESS_EOSR : ReadOutcome::SUCCESS_NO_EOSR;
+}
+
+ReadOutcome ScanRange::DoRead(DiskQueue* queue, int disk_id) {
+  FileReader* file_reader = file_reader_.get();
+  LOG(WARNING) << "current read file: " << file_ << " remote reader."
+               << "tmp_file null?" << (tmp_file_ == nullptr);
+  if (tmp_file_ != nullptr && tmp_file_->mode() == impala::LocalFileMode::BUFFER) {
+    ReadOutcome outcome;
+    // If it is in remote, and the local buffer has been deleted
+    // fetch the file from remote
+    bool need_to_fetch = false;
+    bool is_dumping = false;
+    auto tmp_file_group = tmp_file_->file_group_;
+    bool local_buffer_mode =
+        tmp_file_group->tmp_file_mgr()->remote_tmp_file_local_buff_mode_;
+    boost::shared_lock<shared_mutex> tmp_file_lock(
+        tmp_file_->lock_, boost::defer_lock_t());
+
+    // TODO: yidawu could have a problem if the file has been deleted,
+    // and the range can't be read in one round
+    if (local_buffer_mode) {
+      tmp_file_lock.lock();
+      file_ = tmp_file_->LocalBuffPath();
+      file_reader = local_buffer_reader_.get();
+      LOG(WARNING) << "current read file: " << file_ << " local buffer reader.";
+      {
+        lock_guard<SpinLock> l(tmp_file_->status_lock_);
+        LOG(WARNING) << "do read 1 " << file_;
+        if (!tmp_file_->is_writing() && !tmp_file_->is_dumped()
+            && tmp_file_->is_remote()) {
+          if (tmp_file_->is_dumping()) {
+            is_dumping = true;
+          } else {
+            tmp_file_->SetInDumping();
+          }
+          need_to_fetch = true;
+        }
+      }
+
+      LOG(WARNING) << "do read 2: " << file_;
+      if (need_to_fetch) {
+        mutex* oper_mutex = &(tmp_file_->dump_lock_);
+        ConditionVariable* oper_done = &(tmp_file_->dump_done_);
+        int oper_done_num = 0;
+
+        LOG(WARNING) << "do read 3 " << file_;
+        // TODO: yidawu need to confirm if it works it changes dumped now
+        if (is_dumping) {
+          {
+            unique_lock<mutex> lock(*oper_mutex);
+            while (oper_done_num < 1) oper_done->Wait(lock);
+          }
+          {
+            lock_guard<SpinLock> l(tmp_file_->status_lock_);
+            DCHECK(!tmp_file_->is_dumping());
+            DCHECK(tmp_file_->is_dumped());
+          }
+        } else {
+          LOG(WARNING) << "do read 4" << file_;
+          tmp_file_lock.unlock();
+          // Evict an old file if the buffer in local disk is full.
+          // Reset the local buffer.
+          TmpFileMgr::DeviceId device_id;
+          // May need a unique lock on tmp_file in AssignFreeDevice.
+          {
+            lock_guard<SpinLock> lock(tmp_file_group->lock_);
+            Status af_status = tmp_file_group->AssignFreeDevice(&device_id);
+          }
+          // We don't want the file to be deleted immediately after
+          // fetching. So we keep the lock from here.
+          tmp_file_lock.lock();
+
+          RemoteOperRange::RemoteOperDoneCallback callback = [&](const Status& status) {
+            lock_guard<mutex> l(*oper_mutex);
+            oper_done_num = 1;
+            DCHECK(tmp_file_ != nullptr);
+            // tmp_file_lock.lock();
+            // Push this back to the pool when holding the tmp file lock, we
+            // don't want it to be evicted before reading.
+            tmp_file_->file_group_->EnqueTmpFilesPool(tmp_file_, false);
+            oper_done->NotifyAll();
+          };
+
+          LOG(WARNING) << "do read 5" << tmp_file_->LocalBuffPath();
+          // TODO: yidawu get the unique name back
+          // Could be a multithreading problem when update the tmp file local
+          // buffer path
+          /*
+          string unique_name = lexical_cast<string>(random_generator()());
+          string dir = tmp_file_group->tmp_file_mgr_->tmp_dirs_[device_id].path;
+          string new_path = tmp_file_group->GenerateNewPath(dir, unique_name);
+          LOG(WARNING) << "Generate new path: " << new_path << " device id:" << device_id
+          ;
+          tmp_file_->ResetLocalBuffPath(new_path, device_id);
+          // Update the file path to the new path.
+          file_ = new_path;*/
+          // TODO: yidawu set disk id
+          boost::scoped_ptr<RemoteOperRange> oper_range(new RemoteOperRange(tmp_file_, 0,
+              io_mgr_->RemoteFileFetchDiskId(), RequestType::FETCH, io_mgr_, callback));
+          Status add_status = reader_->AddRemoteOperRange(oper_range.get());
+          {
+            unique_lock<mutex> lock(*oper_mutex);
+            while (oper_done_num < 1) oper_done->Wait(lock);
+          }
+          LOG(WARNING) << "do read 6" << file_;
+
+          {
+            lock_guard<SpinLock> l(tmp_file_->status_lock_);
+            DCHECK(tmp_file_->is_dumping());
+            tmp_file_->SetDumped();
+            tmp_file_->SetInDumping(false);
+          }
+        }
+      }
+    } else {
+      tmp_file_lock.lock();
+      {
+        lock_guard<SpinLock> l(tmp_file_->status_lock_);
+        LOG(WARNING) << "Check remote status:" << tmp_file_->is_remote()
+                     << " , file:" << file_;
+        if (!tmp_file_->is_remote()) {
+          file_ = tmp_file_->LocalBuffPath();
+          file_reader = local_buffer_reader_.get();
+          LOG(WARNING) << "current read file: " << file_ << " local buffer reader.";
+        }
+      }
+    }
+
+    LOG(WARNING) << "do read 7" << file_;
+    outcome = DoReadInternal(queue, disk_id, file_reader);
+    LOG(WARNING) << "do read 8" << file_;
+
+    if (outcome == ReadOutcome::SUCCESS_EOSR) {
+      // Update the pinned count.
+      tmp_file_->UpdatePinCnt();
+      if (tmp_file_->AllPinned()) {
+        lock_guard<SpinLock> sl(tmp_file_->status_lock_);
+        if (tmp_file_->is_dumped() && tmp_file_->AllPinned()) {
+          // Send to the queue, async exec the job.
+          RemoteOperRange::RemoteOperDoneCallback callback = [=](const Status& status) {
+            DCHECK(status.ok());
+            tmp_file_->file_group_->EnqueTmpFilesPool(tmp_file_);
+          };
+          auto io_mgr = reader_->parent_;
+          auto tmp_file = (TmpFileRemote*)tmp_file_;
+          // TODO: yidawu disk id
+          // The perf is back after putting this to the queue
+          tmp_file->evict_range_.reset(
+              new RemoteOperRange(tmp_file, 0, 0, RequestType::EVICT, io_mgr, callback));
+          Status ev_status = reader_->AddRemoteOperRange(tmp_file->evict_range_.get());
+        }
+      }
+    }
+    LOG(WARNING) << "do read 9" << tmp_file_->LocalBuffPath();
+    return outcome;
+  }
+
+  return DoReadInternal(queue, disk_id, file_reader);
 }
 
 Status ScanRange::ReadSubRanges(
@@ -512,8 +647,9 @@ void ScanRange::Reset(hdfsFS fs, const char* file, int64_t len, int64_t offset,
   DCHECK(buffer_opts.client_buffer_ == nullptr ||
          buffer_opts.client_buffer_len_ >= len_);
   fs_ = fs;
-  if (fs_) {
+  if (fs != nullptr || tmp_file != nullptr) {
     file_reader_ = make_unique<HdfsFileReader>(this, fs_, expected_local);
+    local_buffer_reader_ = make_unique<LocalFileReader>(this);
   } else {
     file_reader_ = make_unique<LocalFileReader>(this);
   }

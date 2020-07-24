@@ -33,7 +33,6 @@
 
 namespace impala {
 class TmpFile;
-class TmpFileRemote;
 namespace io {
 class DiskIoMgr;
 class DiskQueue;
@@ -112,6 +111,9 @@ struct RequestType {
   enum type {
     READ,
     WRITE,
+    FETCH,
+    UPLOAD,
+    EVICT,
   };
 };
 
@@ -365,6 +367,8 @@ class ScanRange : public RequestRange {
   /// the underlying filesystem. Caller must not hold 'lock_'.
   ReadOutcome DoRead(DiskQueue* queue, int disk_id);
 
+  ReadOutcome DoReadInternal(DiskQueue* queue, int disk_id, FileReader* file_reader);
+
   /// Cleans up a buffer that was not returned to the client.
   /// Either ReturnBuffer() or CleanUpBuffer() is called for every BufferDescriptor.
   /// The caller must hold 'lock_' via 'scan_range_lock'.
@@ -567,11 +571,12 @@ class ScanRange : public RequestRange {
 
   /// Polymorphic object that is responsible for doing file operations.
   std::unique_ptr<FileReader> file_reader_;
+  std::unique_ptr<FileReader> local_buffer_reader_;
 
   /// If not empty, the ScanRange will only read these parts from the file.
   std::vector<SubRange> sub_ranges_;
 
-  // TODO: yidawu prototype
+  /// It is used to control remote tmporary files.
   TmpFile* tmp_file_ = nullptr;
 
   // Read position in the sub-ranges.
@@ -618,6 +623,8 @@ class WriteRange : public RequestRange {
   /// is called or after the write callback was called).
   void SetData(const uint8_t* buffer, int64_t len);
 
+  void ResetOffset(int64_t file_offset);
+
   void SetTmpFile(TmpFile* tmp_file) { tmp_file_ = tmp_file; }
 
   void SetRequestContext(RequestContext* io_ctx) { io_ctx_ = io_ctx; }
@@ -633,7 +640,6 @@ class WriteRange : public RequestRange {
  private:
   DISALLOW_COPY_AND_ASSIGN(WriteRange);
 
-  friend class impala::TmpFileRemote;
   friend class HdfsFileWriter;
   friend class LocalFileWriter;
 
@@ -646,7 +652,62 @@ class WriteRange : public RequestRange {
 
   RequestContext* io_ctx_;
 
+  TmpFile* tmp_file_ = nullptr;
+};
+
+class RemoteOperRange : public RequestRange {
+ public:
+  /// This callback is invoked on each WriteRange after the write is complete or the
+  /// context is cancelled. The status returned by the callback parameter indicates
+  /// if the write was successful (i.e. Status::OK), if there was an error
+  /// TErrorCode::RUNTIME_ERROR) or if the context was cancelled
+  /// (TErrorCode::CANCELLED_INTERNALLY). The callback is only invoked if this
+  /// WriteRange was successfully added (i.e. AddWriteRange() succeeded). No locks are
+  /// held while the callback is invoked.
+  typedef std::function<void(const Status&)> RemoteOperDoneCallback;
+  RemoteOperRange(TmpFile* tmp_file, int64_t file_offset, int disk_id,
+      RequestType::type type, DiskIoMgr* io_mgr, RemoteOperDoneCallback callback);
+
+  RemoteOperRange(const char* file_path, int disk_id, RequestType::type type,
+      DiskIoMgr* io_mgr, RemoteOperDoneCallback callback);
+
+  /// Set the data and number of bytes to be written for this WriteRange.
+  /// Can only be called when the write is not in flight (i.e. before AddWriteRange()
+  /// is called or after the write callback was called).
+  void SetData(const uint8_t* buffer, int64_t len);
+
+  Status DoOper(uint8* buff, int64_t buff_size);
+
+  Status DoEvict();
+
+  Status DoUpload(uint8* buff, int64_t buff_size);
+
+  Status DoFetch(uint8* buff, int64_t buff_size);
+
+  const uint8_t* data() const { return data_; }
+
+  TmpFile* tmpfile() const { return tmp_file_; }
+
+  RemoteOperDoneCallback callback() const { return callback_; }
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(RemoteOperRange);
+
+  friend class HdfsFileWriter;
+  friend class LocalFileWriter;
+
+  /// Data to be written. RequestRange::len_ contains the length of data
+  /// to be written.
+  const uint8_t* data_;
+
+  /// Callback to invoke after the write is complete.
+  RemoteOperDoneCallback callback_;
+
+  DiskIoMgr* io_mgr_;
+
   TmpFile* tmp_file_;
+
+  const char* file_path_;
 };
 
 inline bool BufferDescriptor::is_cached() const {

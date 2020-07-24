@@ -25,6 +25,7 @@
 #include "runtime/io/data-cache.h"
 #include "runtime/io/disk-io-mgr-internal.h"
 #include "runtime/io/error-converter.h"
+#include "runtime/io/error-converter.h"
 #include "runtime/io/file-writer.h"
 #include "runtime/io/handle-cache.inline.h"
 #include "runtime/tmp-file-mgr-internal.h"
@@ -60,6 +61,7 @@ using namespace strings;
 using std::to_string;
 using boost::uuids::random_generator;
 using boost::filesystem::path;
+using boost::shared_mutex;
 
 // Control the number of disks on the machine.  If 0, this comes from the system
 // settings.
@@ -110,6 +112,10 @@ DEFINE_int32(num_remote_hdfs_io_threads, 8, "Number of remote HDFS I/O threads")
 // open to S3 and use of multiple CPU cores since S3 reads are relatively compute
 // expensive (SSL and JNI buffer overheads).
 DEFINE_int32(num_s3_io_threads, 16, "Number of S3 I/O threads");
+
+DEFINE_int32(num_s3_upload_io_threads, 1, "Number of S3 I/O threads");
+
+DEFINE_int32(num_s3_fetch_io_threads, 1, "Number of S3 I/O threads");
 
 // The maximum number of ABFS I/O threads. TODO: choose the default empirically.
 DEFINE_int32(num_abfs_io_threads, 16, "Number of ABFS I/O threads");
@@ -211,44 +217,336 @@ void WriteRange::SetData(const uint8_t* buffer, int64_t len) {
   len_ = len;
 }
 
-Status WriteRange::DoWrite() {
-  if (!tmp_file_->is_done() || tmp_file_->len() != offset_ + len_) {
-    // The data has been cached for remote file writing
-    LOG(WARNING) << "tmpfile:" << tmp_file_->is_done() << " " << tmp_file_->len()
-                 << " write range:" << offset_ << " " << len_ << " name:" << file()
-                 << " skip";
-    return Status::OK();
-  }
+void WriteRange::ResetOffset(int64_t file_offset) {
+  offset_ = file_offset;
+}
 
+Status WriteRange::DoWrite() {
   Status ret_status = Status::OK();
   Status close_status = Status::OK();
   DiskQueue* queue = io_ctx_->parent_->disk_queues_[disk_id_];
-
+  bool is_ready = false;
+  // TODO: yidawu should be get from property
+  bool local_buffer_mode = true;
+  FileWriter* file_writer = tmp_file_->GetFileWriter(local_buffer_mode);
+  string file_path;
+  if (tmp_file_->mode() == LocalFileMode::BUFFER) {
+    file_path = tmp_file_->LocalBuffPath();
+  } else {
+    file_path = tmp_file_->path();
+  }
   {
+    boost::shared_lock<boost::shared_mutex> lock(tmp_file_->lock_);
     ScopedHistogramTimer write_timer(queue->write_latency());
-    ret_status = tmp_file_->file_writer_->Open();
+    ret_status = file_writer->Open();
+    LOG(WARNING) << "tmpfile:" << tmp_file_->is_done() << " " << tmp_file_->len()
+                 << " name:" << file_path << " opened";
     if (!ret_status.ok()) goto end;
-    ret_status = tmp_file_->file_writer_->Write();
-    close_status = tmp_file_->file_writer_->Close();
+    ret_status = file_writer->Write(this, &is_ready);
+    LOG(WARNING) << "tmpfile:" << tmp_file_->is_done() << " " << tmp_file_->len()
+                 << " name:" << file_path << " written"
+                 << "  isready:" << is_ready;
+    if (is_ready) {
+      LOG(WARNING) << "tmpfile:" << tmp_file_->is_done() << " " << tmp_file_->len()
+                   << " name:" << file_path << " closed";
+      close_status = file_writer->Close();
+    }
     if (ret_status.ok() && !close_status.ok()) ret_status = close_status;
     if (ret_status.ok()) {
-      // tmp_file_->SetDumped() ;
-      // TODO: yidawu only for test, local file should be deleted somewhere else
-      tmp_file_->SetDumped(false);
-      tmp_file_->SetRemote();
-      tmp_file_->SetInMemory(false);
-      LOG(WARNING) << "tmpfile:" << tmp_file_->is_done() << " " << tmp_file_->len()
-                   << " name:" << tmp_file_->path() << " dumped";
+      // Update the unpin count in the file.
+      tmp_file_->UpdateUnpinCnt();
+
+      // The local file will be uploaded to the remote asynchronously
+      // if it is in the buffer mode.
+      if (is_ready && tmp_file_->mode() == LocalFileMode::BUFFER) {
+        // The file is full, trigger to send to remote
+        {
+          lock_guard<SpinLock> l(tmp_file_->status_lock_);
+          tmp_file_->SetDumped();
+          tmp_file_->SetInWriting(false);
+        }
+        LOG(WARNING) << "tmpfile:" << tmp_file_->is_done() << " " << tmp_file_->len()
+                     << " name:" << file_path << " dumped";
+
+        // Make a copy here, since the tmp_file_ can be released in callback
+        string remote_file_path = tmp_file_->path();
+        RemoteOperRange::RemoteOperDoneCallback callback = [=](const Status& status) {
+          {
+            // TODO: yidawu might need to do sth in call back
+            if (tmp_file_ != nullptr) {
+              LOG(WARNING) << "tmpfile:" << remote_file_path << " uploaded, set remote";
+            } else {
+              LOG(WARNING)
+                  << "tmpfile:" << remote_file_path
+                  << " uploaded, but  tmp_file reset, need to try deleting remote";
+              DCHECK(false);
+            }
+          }
+        };
+        auto io_mgr = io_ctx_->parent_;
+        auto tmp_file = (TmpFileRemote*)tmp_file_;
+        tmp_file->upload_range_.reset(new RemoteOperRange(tmp_file, 0,
+            io_mgr->RemoteFileUploadDiskId(), RequestType::UPLOAD, io_mgr, callback));
+        Status add_status = io_ctx_->AddRemoteOperRange(tmp_file->upload_range_.get());
+      }
     }
   }
 
 end:
   if (ret_status.ok()) {
-    queue->write_size()->Update(tmp_file_->len());
+    queue->write_size()->Update(len());
   } else {
     queue->write_io_err()->Increment(1);
   }
   return ret_status;
+}
+
+RemoteOperRange::RemoteOperRange(TmpFile* tmp_file, int64_t file_offset, int disk_id,
+    RequestType::type type, DiskIoMgr* io_mgr, RemoteOperDoneCallback callback)
+  : RequestRange(type), callback_(callback) {
+  offset_ = file_offset;
+  disk_id_ = disk_id;
+  tmp_file_ = tmp_file;
+  io_mgr_ = io_mgr;
+}
+
+RemoteOperRange::RemoteOperRange(const char* file_path, int disk_id,
+    RequestType::type type, DiskIoMgr* io_mgr, RemoteOperDoneCallback callback)
+  : RequestRange(type), callback_(callback) {
+  disk_id_ = disk_id;
+  file_path_ = file_path;
+  io_mgr_ = io_mgr;
+}
+
+void RemoteOperRange::SetData(const uint8_t* buffer, int64_t len) {
+  data_ = buffer;
+  len_ = len;
+}
+
+Status RemoteOperRange::DoOper(uint8* buffer, int64_t buffer_size) {
+  if (request_type() == RequestType::UPLOAD) {
+    return DoUpload(buffer, buffer_size);
+  } else if (request_type() == RequestType::FETCH) {
+    return DoFetch(buffer, buffer_size);
+  } else {
+    DCHECK(request_type() == RequestType::EVICT);
+    return DoEvict();
+  }
+}
+
+Status RemoteOperRange::DoEvict() {
+  DCHECK(tmp_file_ != nullptr);
+  Status status = Status::OK();
+  // Evict the current tmp file.
+  {
+    boost::unique_lock<boost::shared_mutex> sl(tmp_file_->lock_);
+    lock_guard<SpinLock> l(tmp_file_->status_lock_);
+    // File has been evicted already.
+    if (!tmp_file_->is_dumped()) return status;
+    if (!tmp_file_->file_group_->EvictFile(tmp_file_, false).ok()) {
+      // TODO: yidawu error handle
+      DCHECK(false);
+    }
+    LOG(WARNING) << "Update Pin cnt:" << tmp_file_->GetPinCnt()
+                 << " Unpin cnt:" << tmp_file_->GetUnpinCnt()
+                 << " file:" << tmp_file_->LocalBuffPath();
+  }
+  return status;
+}
+
+// TODO: yidawu get the connection from somewhere else
+// TODO: yidawu might need to check if tmpfile is null and quit the job
+Status RemoteOperRange::DoUpload(uint8* buffer, int64_t buffer_size) {
+  int ret;
+  FILE* local_file;
+  hdfsFS hdfs_conn = tmp_file_->hdfs_conn_;
+  DCHECK(hdfs_conn != nullptr);
+  TmpFileRemote* tmp_file = (TmpFileRemote*)tmp_file_;
+  int64_t file_size = tmp_file->file_group_->tmp_file_mgr_->GetRemoteTmpFileSize();
+  int64_t block_size = tmp_file->file_group_->tmp_file_mgr_->GetRemoteTmpBlockSize();
+  buffer_size = block_size;
+
+  const char* remote_file_path = tmp_file->path().c_str();
+  const char* local_file_path = tmp_file->LocalBuffPath().c_str();
+
+  LOG(WARNING) << "In Do Upload local:" << local_file_path
+               << "remote: " << remote_file_path;
+
+  DiskQueue* queue = io_mgr_->disk_queues_[disk_id_];
+
+  // To avoid the local file to be deleted before it is uploaded
+  boost::shared_lock<boost::shared_mutex> sl(tmp_file_->lock_);
+
+  // If it is not dumped, the only case currently should be
+  // all pages have been pinned.
+  {
+    lock_guard<SpinLock> l(tmp_file_->status_lock_);
+    if (!tmp_file_->is_dumped()) {
+      DCHECK(tmp_file_->AllPinned());
+      return Status::OK();
+    }
+  }
+
+  // Read local file to the buffer
+  Status status = io_mgr_->local_file_system_->OpenForRead(
+      local_file_path, O_RDONLY, S_IRUSR | S_IWUSR, &local_file);
+  hdfsFile tmp_hdfs_file =
+      hdfsOpenFile(hdfs_conn, remote_file_path, O_WRONLY, 0, 0, block_size);
+
+  int64_t offset = 0;
+  int64_t retry = 0;
+  // Read the remote file to local buffer.
+  while (file_size != offset) {
+    status = io_mgr_->local_file_system_->Fread(
+        local_file, buffer, buffer_size, local_file_path);
+    if (status.ok()) {
+      // Write local buffer to the remote file.
+      while (retry < 3) {
+        {
+          ScopedHistogramTimer write_timer(queue->write_latency());
+          ret = hdfsWrite(hdfs_conn, tmp_hdfs_file, buffer, buffer_size);
+        }
+        if (ret == -1 || ret != buffer_size) {
+          // TODO: yidawu error handling
+          // need to rewrite the whole file
+          // Or we need to locate the offset of the local file
+          string error_msg = GetHdfsErrorMsg("");
+          LOG(WARNING) << "Failed to write data (length: " << buffer_size
+                       << ") to Hdfs file: " << remote_file_path << " " << error_msg;
+          retry++;
+          queue->write_io_err()->Increment(1);
+          continue;
+        }
+        offset += buffer_size;
+        queue->write_size()->Update(buffer_size);
+        retry = 0;
+        break;
+      }
+      if (retry == 3) {
+        LOG(WARNING) << "Failed to write " << remote_file_path
+                     << " offset:" << std::to_string(offset);
+        break;
+      }
+    } else {
+      LOG(WARNING) << "Failed to read: file: " << local_file_path;
+      if (++retry == 3) {
+        // Retry failed
+        LOG(WARNING) << "Failed to read for three times: " << local_file_path
+                     << " offset:" << std::to_string(offset);
+        break;
+      }
+    }
+  }
+
+  ret = hdfsCloseFile(hdfs_conn, tmp_hdfs_file);
+  if (ret != 0) {
+    LOG(WARNING) << GetHdfsErrorMsg("Failed to close HDFS file: ", remote_file_path);
+  }
+
+  status = io_mgr_->local_file_system_->Fclose(local_file, local_file_path);
+
+  // TODO: yidawu maybe put these in callback func
+  {
+    lock_guard<SpinLock> l(tmp_file->status_lock_);
+    tmp_file_->SetRemote();
+    LOG(WARNING) << "remote set, file:" << remote_file_path;
+  }
+  bool evict_first =
+      tmp_file_->file_group_->tmp_file_mgr_->remote_tmp_files_avail_pool_lifo_;
+  // Push it to the pool.
+  tmp_file_->file_group_->EnqueTmpFilesPool(tmp_file_, evict_first);
+
+  LOG(WARNING) << "End Upload  to the Remote, file uploaed:" << remote_file_path;
+  return Status::OK();
+}
+
+Status RemoteOperRange::DoFetch(uint8_t* buffer, int64_t buffer_size) {
+  int ret;
+  FILE* local_file;
+  // TODO: yidawu get the connection from somewhere else
+  // might need to lock for using the connection
+  hdfsFS hdfs_conn = tmp_file_->hdfs_conn_;
+  DCHECK(hdfs_conn != nullptr);
+  TmpFileRemote* tmp_file = (TmpFileRemote*)tmp_file_;
+  int64_t file_size = tmp_file->file_group_->tmp_file_mgr_->GetRemoteTmpFileSize();
+  int64_t block_size = tmp_file->file_group_->tmp_file_mgr_->GetRemoteTmpBlockSize();
+  buffer_size = block_size;
+
+  const char* remote_file_path = tmp_file->path().c_str();
+  DCHECK(!tmp_file->LocalBuffPath().empty());
+  const char* local_file_path = tmp_file->LocalBuffPath().c_str();
+
+  DiskQueue* queue = io_mgr_->disk_queues_[disk_id_];
+
+  LOG(WARNING) << "In FetchFromRemote remote:" << remote_file_path
+               << " local:" << local_file_path
+               << " bufer size:" << to_string(buffer_size);
+
+  io::WriteRange::WriteDoneCallback callback = [](const Status& status) {};
+  boost::scoped_ptr<WriteRange> write_range(
+      new WriteRange(local_file_path, 0, 0, callback));
+  write_range->SetData(buffer, buffer_size);
+
+  // TODO: yidawu the lock
+  // To avoid the local file remained the disk after the tmp file deconstructs.
+  // shared_lock<shared_mutex> sl(tmp_file_->lock_);
+
+  // TODO: yidawu check the status of the tmp file, if it is null, quit the job
+
+  hdfsFile tmp_hdfs_file =
+      hdfsOpenFile(hdfs_conn, remote_file_path, O_RDONLY, 0, 0, block_size);
+  Status status = io_mgr_->local_file_system_->OpenForWrite(
+      local_file_path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR, &local_file);
+  if (!status.ok()) {
+    LOG(WARNING) << "Open file to write failed: file: " << local_file_path;
+  }
+
+  int64_t offset = 0;
+  int64_t retry = 0;
+  // Read the remote file to local buffer.
+  while (file_size != offset) {
+    {
+      ScopedHistogramTimer read_timer(queue->read_latency());
+      ret = hdfsPreadFully(hdfs_conn, tmp_hdfs_file, offset, buffer, buffer_size);
+    }
+    if (ret != -1) {
+      queue->read_size()->Update(buffer_size);
+      // Write the buffer to local file.
+      status = io_mgr_->WriteRangeHelper(local_file, write_range.get());
+      if (!status.ok()) {
+        LOG(WARNING) << "Write file failed: file: " << local_file_path;
+      }
+      offset += buffer_size;
+      write_range->ResetOffset(offset);
+      retry = 0;
+    } else {
+      LOG(WARNING) << "Failed to read: file: " << remote_file_path;
+      // TODO: yidawu read io error
+      if (++retry == 3) {
+        // Retry failed
+        LOG(WARNING) << "Failed to read for three times: " << remote_file_path;
+        break;
+      }
+    }
+  }
+
+  status = io_mgr_->local_file_system_->Fclose(local_file, local_file_path);
+  if (!status.ok()) {
+    LOG(WARNING) << "Close file failed: file: " << local_file_path;
+  }
+
+  ret = hdfsCloseFile(hdfs_conn, tmp_hdfs_file);
+  if (ret != 0) {
+    LOG(WARNING) << GetHdfsErrorMsg("Failed to close HDFS file: ", remote_file_path);
+  }
+
+  {
+    lock_guard<SpinLock> l(tmp_file->status_lock_);
+    DCHECK(!tmp_file_->is_dumped());
+    tmp_file_->SetDumped();
+  }
+  LOG(WARNING) << "End FetchFromRemote, file dumped:" << local_file_path;
+  return Status::OK();
 }
 
 static void CheckSseSupport() {
@@ -340,6 +638,12 @@ Status DiskIoMgr::Init() {
     } else if (i == RemoteOzoneDiskId()) {
       num_threads_per_disk = FLAGS_num_ozone_io_threads;
       device_name = "Ozone remote";
+    } else if (i == RemoteFileUploadDiskId()) {
+      num_threads_per_disk = FLAGS_num_s3_upload_io_threads;
+      device_name = "File Upload from local to remote";
+    } else if (i == RemoteFileFetchDiskId()) {
+      num_threads_per_disk = FLAGS_num_s3_fetch_io_threads;
+      device_name = "File Fetch from remote to local";
     } else if (DiskInfo::is_rotational(i)) {
       num_threads_per_disk = num_io_threads_per_rotational_disk_;
       // During tests, i may not point to an existing disk.
@@ -593,16 +897,39 @@ void DiskQueue::DiskThreadLoop(DiskIoMgr* io_mgr) {
     ScopedThreadContext tdi_scope(GetThreadDebugInfo(), worker_context->query_id(),
         worker_context->instance_id());
 
-    if (range->request_type() == RequestType::READ) {
-      ScanRange* scan_range = static_cast<ScanRange*>(range);
-      ReadOutcome outcome = scan_range->DoRead(this, disk_id_);
-      worker_context->ReadDone(disk_id_, outcome, scan_range);
-    } else {
-      DCHECK(range->request_type() == RequestType::WRITE);
-      // io_mgr->Write(worker_context, static_cast<WriteRange*>(range));
-      WriteRange* write_range = static_cast<WriteRange*>(range);
-      Status status = write_range->DoWrite();
-      worker_context->WriteDone(write_range, status);
+    switch (range->request_type()) {
+      case RequestType::READ: {
+        ScanRange* scan_range = static_cast<ScanRange*>(range);
+        ReadOutcome outcome = scan_range->DoRead(this, disk_id_);
+        worker_context->ReadDone(disk_id_, outcome, scan_range);
+      } break;
+      case RequestType::WRITE: {
+        WriteRange* write_range = static_cast<WriteRange*>(range);
+        Status status = write_range->DoWrite();
+        worker_context->WriteDone(write_range, status);
+      } break;
+      case RequestType::UPLOAD:
+      case RequestType::FETCH: {
+        // const int64_t size =
+        // ExecEnv::GetInstance()->tmp_file_mgr()->GetRemoteTmpFileSize();
+        /*if (disk_id_ == io_mgr->RemoteFileOperDiskId()) {
+          buffer_ = (uint8*)malloc(size) ;
+        }*/
+        int64_t size = 16 * 1024 * 1024;
+        uint8* buffer = (uint8*)malloc(size);
+        DCHECK(buffer != nullptr);
+        RemoteOperRange* oper_range = static_cast<RemoteOperRange*>(range);
+        Status oper_status = oper_range->DoOper(buffer, size);
+        worker_context->RemoteOperDone(oper_range, oper_status);
+        free(buffer);
+      } break;
+      case RequestType::EVICT: {
+        RemoteOperRange* oper_range = static_cast<RemoteOperRange*>(range);
+        Status oper_status = oper_range->DoOper(nullptr, 0);
+        worker_context->RemoteOperDone(oper_range, oper_status);
+      } break;
+      default:
+        DCHECK(false);
     }
   }
 }

@@ -1621,8 +1621,8 @@ const datasketches::target_hll_type DS_HLL_TYPE = datasketches::target_hll_type:
 /// it wrapped into a StringVal.
 /// Introducing this function in the .cc to avoid including the whole DataSketches HLL
 /// functionality into the header.
-StringVal SerializeDsHllSketch(FunctionContext* ctx,
-    const datasketches::hll_sketch& sketch) {
+StringVal SerializeDsHllSketch(
+    FunctionContext* ctx, const datasketches::hll_sketch& sketch) {
   std::stringstream serialized_sketch;
   sketch.serialize_compact(serialized_sketch);
   std::string serialized_sketch_str = serialized_sketch.str();
@@ -1646,8 +1646,7 @@ void AggregateFunctions::DsHllInit(FunctionContext* ctx, StringVal* dst) {
 }
 
 template <typename T>
-void AggregateFunctions::DsHllUpdate(FunctionContext* ctx, const T& src,
-    StringVal* dst) {
+void AggregateFunctions::DsHllUpdate(FunctionContext* ctx, const T& src, StringVal* dst) {
   if (src.is_null) return;
   DCHECK(!dst->is_null);
   DCHECK_EQ(dst->len, sizeof(datasketches::hll_sketch));
@@ -1668,8 +1667,7 @@ void AggregateFunctions::DsHllUpdate(
   sketch_ptr->update(reinterpret_cast<char*>(src.ptr), src.len);
 }
 
-StringVal AggregateFunctions::DsHllSerialize(FunctionContext* ctx,
-    const StringVal& src) {
+StringVal AggregateFunctions::DsHllSerialize(FunctionContext* ctx, const StringVal& src) {
   DCHECK(!src.is_null);
   DCHECK_EQ(src.len, sizeof(datasketches::hll_sketch));
   datasketches::hll_sketch* sketch_ptr =
@@ -1707,8 +1705,8 @@ BigIntVal AggregateFunctions::DsHllFinalize(FunctionContext* ctx, const StringVa
   return (estimate == 0) ? BigIntVal::null() : estimate;
 }
 
-StringVal AggregateFunctions::DsHllFinalizeSketch(FunctionContext* ctx,
-    const StringVal& src) {
+StringVal AggregateFunctions::DsHllFinalizeSketch(
+    FunctionContext* ctx, const StringVal& src) {
   DCHECK(!src.is_null);
   DCHECK_EQ(src.len, sizeof(datasketches::hll_sketch));
   datasketches::hll_sketch* sketch_ptr =

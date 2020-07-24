@@ -34,29 +34,41 @@ namespace io {
 
 HdfsFileWriter::~HdfsFileWriter() {
   DCHECK(exclusive_hdfs_fh_ == nullptr) << "File was not closed.";
+  if (expected_local_) {
+    // TODO: yidawu delete, just for compile, not used
+  }
 }
 
 Status HdfsFileWriter::Open() {
   //  RETURN_IF_ERROR(write_range_->cancel_status_);
   // TODO: yidawu add Metric
   DCHECK(hdfs_conn_ != nullptr);
-  // TODO: yidawu mtime
-  int block_size = 1024 * 1024;
-  hdfs_file_ = hdfsOpenFile(hdfs_conn_, write_range_->file(), O_WRONLY, 0, 0, block_size);
-  ImpaladMetrics::IO_MGR_NUM_OPEN_FILES->Increment(1L);
+  if (hdfs_file_ == nullptr) {
+    std::lock_guard<mutex> l(lock_);
+    if (hdfs_file_ != nullptr) return Status::OK();
+    hdfs_file_ =
+        hdfsOpenFile(hdfs_conn_, tmp_file_->path().c_str(), O_WRONLY, 0, 0, block_size_);
+    ImpaladMetrics::IO_MGR_NUM_OPEN_FILES->Increment(1L);
+  }
   return Status::OK();
 }
 
-Status HdfsFileWriter::Write() {
+Status HdfsFileWriter::Write(WriteRange* range, bool* is_ready) {
   DCHECK(hdfs_file_ != nullptr);
+  std::lock_guard<mutex> l(lock_);
   // hdfsFile hdfs_file = exclusive_hdfs_fh_->file();
-  TmpFileRemote* tmpfile = (TmpFileRemote*)(write_range_->tmpfile());
-  int ret = hdfsWrite(hdfs_conn_, hdfs_file_, tmpfile->buffer(), tmpfile->len());
-  LOG(INFO) << write_range_->file() << " written";
+  int ret = hdfsWrite(hdfs_conn_, hdfs_file_, range->data(), range->len());
+  LOG(INFO) << range->file() << " written";
   if (ret == -1) {
-    string error_msg = GetHdfsErrorMsg("");
-    LOG(WARNING) << "Failed to write data (length: " << write_range_->len()
-                 << ") to Hdfs file: " << write_range_->file() << " " << error_msg;
+    stringstream msg;
+    msg << "Failed to write data (length: " << range->len() << ") to Hdfs file: ";
+    return Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
+        GetHdfsErrorMsg(msg.str(), range->file()));
+  } else {
+    range->ResetOffset(written_bytes_);
+    if (UpdateWrittenSize(range->len())) {
+      *is_ready = true;
+    }
   }
   return Status::OK();
 }
@@ -65,7 +77,8 @@ Status HdfsFileWriter::Close() {
   DCHECK(hdfs_file_ != nullptr);
   int ret = hdfsCloseFile(hdfs_conn_, hdfs_file_);
   if (ret != 0) {
-    LOG(WARNING) << GetHdfsErrorMsg("Failed to close HDFS file: ", write_range_->file());
+    return Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
+        GetHdfsErrorMsg("Failed to close HDFS file: ", tmp_file_->path()));
   }
   ImpaladMetrics::IO_MGR_NUM_OPEN_FILES->Increment(-1L);
   return Status::OK();

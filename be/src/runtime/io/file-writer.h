@@ -22,8 +22,9 @@
 #include "common/status.h"
 
 namespace impala {
+class TmpFile;
 namespace io {
-
+class DiskIoMgr;
 class WriteRange;
 
 /// Abstract class that provides interface for file operations
@@ -33,23 +34,32 @@ class WriteRange;
 /// a ScanRange object only has a single FileReader object.
 class FileWriter {
  public:
-  FileWriter() {}
+  FileWriter(DiskIoMgr* io_mgr, TmpFile* tmp_file, const int64_t file_size)
+    : io_mgr_(io_mgr), tmp_file_(tmp_file), file_size_(file_size) {}
   virtual ~FileWriter() {}
 
   /// Opens file that is associated with 'scan_range_'.
   virtual Status Open() = 0;
 
-  virtual Status Write() = 0;
+  virtual Status Write(WriteRange*, bool*) = 0;
 
   /// Closes the file associated with 'scan_range_'. It doesn't have effect on other
   /// scan ranges.
   virtual Status Close() = 0;
 
-  // TODO: yidawu comment
-  virtual void Reset(WriteRange* range) { write_range_ = range; }
+  // The caller holds the lock to guarantee thread-safe
+  bool UpdateWrittenSize(int64_t val) {
+    written_bytes_ += val;
+    DCHECK(written_bytes_ <= file_size_);
+    return written_bytes_ == file_size_;
+  }
 
  protected:
-  WriteRange* write_range_ = nullptr;
+  DiskIoMgr* io_mgr_ = nullptr;
+  TmpFile* tmp_file_ = nullptr;
+  std::mutex lock_;
+  int64_t written_bytes_ = 0;
+  const int64_t file_size_;
 };
 }
 }
