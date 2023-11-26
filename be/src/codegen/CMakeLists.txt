@@ -36,6 +36,7 @@ add_library(CodeGen
   codegen-util.cc
   llvm-codegen.cc
   llvm-codegen-cache.cc
+  llvm-codegen-object-cache.cc
   instruction-counter.cc
   ${IR_O1_C_FILE}
   ${IR_O2_C_FILE}
